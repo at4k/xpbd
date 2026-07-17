@@ -20,6 +20,26 @@ _TETS_ODD = (
 )
 
 
+_TET_EDGES = np.array([[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]])
+_TET_FACES = np.array([[1, 2, 3], [0, 3, 2], [0, 1, 3], [0, 2, 1]])
+
+
+def edges_from_tets(tets: np.ndarray) -> np.ndarray:
+    """Unique undirected edges of a tet mesh, each row sorted ascending."""
+    pairs = tets[:, _TET_EDGES].reshape(-1, 2)
+    return np.unique(np.sort(pairs, axis=1), axis=0)
+
+
+def surface_from_tets(tets: np.ndarray) -> np.ndarray:
+    """Boundary triangles of a tet mesh (faces appearing exactly once)."""
+    faces = tets[:, _TET_FACES].reshape(-1, 3)
+    keys = np.sort(faces, axis=1)
+    _, first, counts = np.unique(
+        keys, axis=0, return_index=True, return_counts=True
+    )
+    return faces[first[counts == 1]]
+
+
 def tet_volumes(positions: np.ndarray, tets: np.ndarray) -> np.ndarray:
     """Signed volumes of tetrahedra, shape (T,)."""
     p = positions[tets]
