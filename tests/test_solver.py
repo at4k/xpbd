@@ -94,12 +94,8 @@ def dropped_cube_scene(mode):
     positions[:, 1] += 1.0
     body = SoftBody.from_tet_mesh(positions, tets)
     constraints = [
-        DistanceConstraint.from_positions(
-            body.positions, body.edges, relaxation=0.35
-        ),
-        VolumeConstraint.from_positions(
-            body.positions, body.tets, relaxation=0.35
-        ),
+        DistanceConstraint.from_positions(body.positions, body.edges),
+        VolumeConstraint.from_positions(body.positions, body.tets),
         GroundConstraint(len(body.positions)),
     ]
     return body, Solver(body, constraints, n_substeps=20, mode=mode)

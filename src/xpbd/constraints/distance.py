@@ -50,9 +50,17 @@ class DistanceConstraint:
         w = inv_mass[i] + inv_mass[j]
         dlam = -(c + alpha * self.lam) / np.maximum(w + alpha, _EPS)
         self.lam += dlam
-        corr = (self.relaxation * dlam)[:, None] * n
-        np.add.at(x, j, inv_mass[j][:, None] * corr)
-        np.add.at(x, i, -inv_mass[i][:, None] * corr)
+        # Averaged Jacobi: accumulate corrections and divide by the number
+        # of constraints touching each vertex so simultaneous updates stay
+        # stable regardless of vertex valence.
+        corr = dlam[:, None] * n
+        delta = np.zeros_like(x)
+        count = np.zeros(len(x))
+        np.add.at(delta, j, inv_mass[j][:, None] * corr)
+        np.add.at(delta, i, -inv_mass[i][:, None] * corr)
+        np.add.at(count, i, 1.0)
+        np.add.at(count, j, 1.0)
+        x += self.relaxation * delta / np.maximum(count, 1.0)[:, None]
 
     def project_one(
         self, k: int, x: np.ndarray, inv_mass: np.ndarray, h: float

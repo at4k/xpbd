@@ -64,10 +64,16 @@ class VolumeConstraint:
         )
         dlam = -(c + alpha * self.lam) / np.maximum(w + alpha, _EPS)
         self.lam += dlam
-        s = self.relaxation * dlam
+        # Averaged Jacobi: accumulate corrections and divide by the number
+        # of constraints touching each vertex so simultaneous updates stay
+        # stable regardless of vertex valence.
+        delta = np.zeros_like(x)
+        count = np.zeros(len(x))
         for col, g in zip(range(4), (g0, g1, g2, g3)):
             idx = t[:, col]
-            np.add.at(x, idx, (inv_mass[idx] * s)[:, None] * g)
+            np.add.at(delta, idx, (inv_mass[idx] * dlam)[:, None] * g)
+            np.add.at(count, idx, 1.0)
+        x += self.relaxation * delta / np.maximum(count, 1.0)[:, None]
 
     def project_one(
         self, k: int, x: np.ndarray, inv_mass: np.ndarray, h: float
