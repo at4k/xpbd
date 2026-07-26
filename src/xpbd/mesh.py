@@ -47,6 +47,48 @@ def tet_volumes(positions: np.ndarray, tets: np.ndarray) -> np.ndarray:
     return np.einsum("ij,ij->i", cross, p[:, 3] - p[:, 0]) / 6.0
 
 
+_TRI_EDGES = np.array([[0, 1], [1, 2], [2, 0]])
+
+
+def edges_from_faces(faces: np.ndarray) -> np.ndarray:
+    """Unique undirected edges of a triangle mesh, each row sorted ascending."""
+    pairs = faces[:, _TRI_EDGES].reshape(-1, 2)
+    return np.unique(np.sort(pairs, axis=1), axis=0)
+
+
+def extract_boundary_mesh(
+    positions: np.ndarray, tets: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extracts boundary surface mesh (positions, faces) and removes internal vertices."""
+    faces = surface_from_tets(tets)
+    unique_v, inverse = np.unique(faces, return_inverse=True)
+    new_positions = positions[unique_v]
+    new_faces = inverse.reshape(faces.shape)
+    return new_positions, new_faces
+
+
+def sphere_mesh(
+    subdivisions: int = 4,
+    radius: float = 1.0,
+    origin: tuple = (0.0, 0.0, 0.0),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generates a spherified box surface mesh."""
+    pos, tets = tet_grid(
+        subdivisions,
+        subdivisions,
+        subdivisions,
+        spacing=2.0 / subdivisions,
+        origin=(-1.0, -1.0, -1.0),
+    )
+    pos_b, faces = extract_boundary_mesh(pos, tets)
+    norms = np.linalg.norm(pos_b, axis=1)
+    norms = np.maximum(norms, 1e-12)
+    pos_sphere = (pos_b / norms[:, None]) * radius + np.asarray(
+        origin, dtype=np.float64
+    )
+    return pos_sphere, faces
+
+
 def tet_grid(
     nx: int,
     ny: int,
