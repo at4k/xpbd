@@ -367,8 +367,13 @@ def main() -> None:
 
     def handle_mouse_interaction(io) -> None:
         nonlocal grabbed_idx, grabbed_depth, last_target_pos
-        mouse_pos = (float(io.MousePos.x), float(io.MousePos.y))
+        m_pos = io.MousePos
+        if hasattr(m_pos, "x"):
+            mouse_pos = (float(m_pos.x), float(m_pos.y))
+        else:
+            mouse_pos = (float(m_pos[0]), float(m_pos[1]))
         is_down = io.MouseDown[0]
+
 
         # Convert screen mouse coordinate to 3D Ray safely
         try:
