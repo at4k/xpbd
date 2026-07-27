@@ -297,6 +297,8 @@ def main() -> None:
 
     is_running = True
     push_radius = 0.35
+    pusher_depth = 2.0
+    direct_mouse_push = True
     pusher_pos = np.array([0.0, 0.5, 0.0])
 
     def reset_simulation() -> None:
@@ -336,7 +338,7 @@ def main() -> None:
         np.random.seed()
         for s_start, s_end in surf_vertex_ranges:
             rand_dir = np.random.uniform(-1.0, 1.0, size=3)
-            rand_dir[1] = 0.2  # Slight upward boost
+            rand_dir[1] = 0.2
             rand_dir = rand_dir / np.linalg.norm(rand_dir)
             indices = np.arange(s_start, s_end)
             body.velocities[indices] += rand_dir * 3.5
@@ -406,10 +408,10 @@ def main() -> None:
 
         marker = ps.register_point_cloud("push_tool_marker", np.array([pusher_pos]))
         if np.any(inside) or is_active:
-            marker.set_color((1.0, 0.3, 0.1))  # Bright glowing orange when hitting or active
-            marker.set_radius(push_radius * 0.5)
+            marker.set_color((1.0, 0.3, 0.1))  # Bright glowing orange when hitting/pushing
+            marker.set_radius(push_radius * 0.45)
 
-            if np.any(inside):
+            if is_active or np.any(inside):
                 for idx in np.where(inside)[0]:
                     d = dists[idx]
                     dir_vec = np.array([0.0, 1.0, 0.0]) if d < 1e-6 else vecs[idx] / d
@@ -417,7 +419,7 @@ def main() -> None:
                     body.velocities[idx] = (target_p - pos[idx]) / DT
                     pos[idx] = target_p
         else:
-            marker.set_color((0.2, 0.9, 1.0))  # Cyan preview
+            marker.set_color((0.2, 0.9, 1.0))  # Cyan preview when hovering
             marker.set_radius(0.04)
 
     def step_simulation() -> None:
@@ -432,26 +434,47 @@ def main() -> None:
             cloud.update_point_positions(body.positions[p_start:p_end])
 
     def frame() -> None:
-        nonlocal is_running, push_radius, pusher_pos
+        nonlocal is_running, push_radius, pusher_pos, pusher_depth, direct_mouse_push
         import polyscope.imgui as imgui
 
         io = imgui.GetIO()
 
-        # Update pusher position from screen ray if mouse clicked
         is_down = bool(io.MouseDown[0])
-        try:
-            m_pos = io.MousePos
-            px = float(m_pos.x) if hasattr(m_pos, "x") else float(m_pos[0])
-            py = float(m_pos.y) if hasattr(m_pos, "y") else float(m_pos[1])
-            ray_o, ray_d = ps.screen_coords_to_world_ray((px, py))
-            if ray_o is not None and ray_d is not None and not np.any(np.isnan(ray_o)):
-                norm_d = np.linalg.norm(ray_d)
-                if norm_d > 1e-6:
-                    ray_d = ray_d / norm_d
-                    # Project pusher sphere to ray
-                    pusher_pos = ray_o + ray_d * 2.0
-        except Exception:
-            pass
+
+        if direct_mouse_push:
+            # Mouse Wheel adjusts pusher depth in 3D space
+            if abs(io.MouseWheel) > 0.01:
+                pusher_depth += io.MouseWheel * 0.15
+
+            try:
+                m_pos = io.MousePos
+                px = float(m_pos.x) if hasattr(m_pos, "x") else float(m_pos[0])
+                py = float(m_pos.y) if hasattr(m_pos, "y") else float(m_pos[1])
+
+                # Convert screen mouse coordinate to 3D ray
+                ray_o, ray_d = ps.screen_coords_to_world_ray((px, py))
+
+                if ray_o is not None and ray_d is not None and not np.any(np.isnan(ray_o)):
+                    norm_d = np.linalg.norm(ray_d)
+                    if norm_d > 1e-6:
+                        ray_d = ray_d / norm_d
+
+                        # Check nearest object hit for auto depth snapping
+                        pos = body.positions
+                        diff = pos - ray_o
+                        t_proj = np.maximum(0.0, np.dot(diff, ray_d))
+                        closest_pts = ray_o + t_proj[:, None] * ray_d
+                        dists = np.linalg.norm(pos - closest_pts, axis=1)
+                        min_idx = np.argmin(dists)
+
+                        if dists[min_idx] < 1.2 and not is_down:
+                            # Auto-snap depth to nearest object surface when hovering
+                            pusher_depth = float(t_proj[min_idx])
+
+                        # Project 3D Pusher sphere to current mouse ray
+                        pusher_pos = ray_o + ray_d * pusher_depth
+            except Exception:
+                pass
 
         imgui.Text("Simulation Controls:")
         if imgui.Button("Reset / Restart"):
@@ -475,7 +498,16 @@ def main() -> None:
             apply_poke_force()
 
         imgui.Separator()
-        imgui.Text("3D Pusher Tool (3D Sphere Interactor):")
+        imgui.Text("Direct Mouse 3D Pusher:")
+        res_push = imgui.Checkbox("Direct Mouse Control (Move Mouse to Push Bags)", direct_mouse_push)
+        direct_mouse_push = res_push[1] if isinstance(res_push, tuple) else res_push
+
+        if direct_mouse_push:
+            imgui.TextColored((0.2, 1.0, 0.4, 1.0), "Mouse Active: Move mouse to position 3D Marker, Left-click/Drag to Push!")
+            imgui.TextColored((0.8, 0.8, 0.2, 1.0), "Use Mouse Wheel to adjust Pusher Depth/Height forward & backward.")
+        else:
+            imgui.TextColored((0.7, 0.7, 0.7, 1.0), "Manual Slider Control Active.")
+
         _, push_radius = imgui.SliderFloat("Pusher Radius", push_radius, 0.1, 0.8)
         _, pusher_pos[0] = imgui.SliderFloat("Pusher X (Left/Right)", pusher_pos[0], -1.0, 1.0)
         _, pusher_pos[1] = imgui.SliderFloat("Pusher Y (Up/Down / Height)", pusher_pos[1], 0.0, 2.5)
@@ -488,6 +520,7 @@ def main() -> None:
 
     ps.set_user_callback(frame)
     ps.show()
+
 
 
 
