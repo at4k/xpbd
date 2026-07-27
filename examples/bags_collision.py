@@ -292,9 +292,7 @@ def main() -> None:
     body = solver.body
 
     # Backup initial positions & velocities for instant reset
-    init_positions = body.positions.copy()
-    init_velocities = body.velocities.copy()
-
+    is_running = True
     nav_mode = 0  # 0: Mouse Physics Push Mode (Camera Locked), 1: Camera Orbit Mode
     push_radius = 0.35
     pusher_depth = 2.0
@@ -306,6 +304,7 @@ def main() -> None:
         body.velocities[:] = init_velocities.copy()
         solver.reset()
         update_visuals()
+
 
     def apply_push_up_force() -> None:
         """Pushes bags from bottom upwards for instant visual reaction."""
