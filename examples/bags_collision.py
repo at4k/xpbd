@@ -296,19 +296,50 @@ def main() -> None:
     init_velocities = body.velocities.copy()
 
     is_running = True
-    tool_mode = 0  # 0: Push Tool, 1: Grab Tool
-    push_radius = 0.30
-    push_depth_offset = 0.0
-    grabbed_idx = None
-    grabbed_depth = 0.0
-    last_target_pos = None
+    push_radius = 0.35
+    pusher_pos = np.array([0.0, 0.5, 0.0])
 
     def reset_simulation() -> None:
-        nonlocal is_running, grabbed_idx
-        grabbed_idx = None
+        nonlocal is_running
         body.positions[:] = init_positions.copy()
         body.velocities[:] = init_velocities.copy()
         solver.reset()
+        update_visuals()
+
+    def apply_push_up_force() -> None:
+        """Pushes bags from bottom upwards for instant visual reaction."""
+        pos = body.positions
+        for s_start, s_end in surf_vertex_ranges:
+            surf = pos[s_start:s_end]
+            centroid = np.mean(surf, axis=0)
+            bottom_mask = surf[:, 1] < centroid[1]
+            indices = np.arange(s_start, s_end)[bottom_mask]
+            body.velocities[indices, 1] += 4.5
+            body.positions[indices, 1] += 0.05
+        update_visuals()
+
+    def apply_squash_force() -> None:
+        """Squashes bags from top downwards for instant visual reaction."""
+        pos = body.positions
+        for s_start, s_end in surf_vertex_ranges:
+            surf = pos[s_start:s_end]
+            centroid = np.mean(surf, axis=0)
+            top_mask = surf[:, 1] > centroid[1]
+            indices = np.arange(s_start, s_end)[top_mask]
+            body.velocities[indices, 1] -= 4.5
+            body.positions[indices, 1] -= 0.05
+        update_visuals()
+
+    def apply_poke_force() -> None:
+        """Pokes bags horizontally with random impulses."""
+        pos = body.positions
+        np.random.seed()
+        for s_start, s_end in surf_vertex_ranges:
+            rand_dir = np.random.uniform(-1.0, 1.0, size=3)
+            rand_dir[1] = 0.2  # Slight upward boost
+            rand_dir = rand_dir / np.linalg.norm(rand_dir)
+            indices = np.arange(s_start, s_end)
+            body.velocities[indices] += rand_dir * 3.5
         update_visuals()
 
     ps.init()
@@ -367,98 +398,27 @@ def main() -> None:
                 scale = (r_max_allowed / np.maximum(dists[too_far], 1e-12))[:, None]
                 pos[p_start:p_end][too_far] = centroid + vecs[too_far] * scale
 
-    def handle_mouse_interaction(io) -> None:
-        nonlocal grabbed_idx, grabbed_depth, last_target_pos
-        m_pos = io.MousePos
-        if hasattr(m_pos, "x"):
-            mouse_pos = (float(m_pos.x), float(m_pos.y))
-        else:
-            mouse_pos = (float(m_pos[0]), float(m_pos[1]))
-
-        is_down = bool(io.MouseDown[0])
-
-        try:
-            ray_o, ray_d = ps.screen_coords_to_world_ray(mouse_pos)
-        except Exception:
-            return
-
-        if ray_o is None or ray_d is None or np.any(np.isnan(ray_o)) or np.any(np.isnan(ray_d)):
-            return
-
-        norm_d = np.linalg.norm(ray_d)
-        if norm_d < 1e-6 or np.isnan(norm_d):
-            return
-
-        ray_d = ray_d / norm_d
-
-        # Calculate 3D tool position along ray
+    def update_pusher_physics(is_active: bool) -> None:
         pos = body.positions
-        diff = pos - ray_o
-        t_proj = np.maximum(0.0, np.dot(diff, ray_d))
-        closest_pts = ray_o + t_proj[:, None] * ray_d
-        dists = np.linalg.norm(pos - closest_pts, axis=1)
-        min_idx = np.argmin(dists)
+        vecs = pos - pusher_pos
+        dists = np.linalg.norm(vecs, axis=1)
+        inside = dists < push_radius
 
-        # Default depth at nearest object or fixed distance
-        tool_depth = t_proj[min_idx] if dists[min_idx] < 1.5 else 2.0
-        tool_depth += push_depth_offset
-        tool_center = ray_o + ray_d * tool_depth
+        marker = ps.register_point_cloud("push_tool_marker", np.array([pusher_pos]))
+        if np.any(inside) or is_active:
+            marker.set_color((1.0, 0.3, 0.1))  # Bright glowing orange when hitting or active
+            marker.set_radius(push_radius * 0.5)
 
-        # Register 3D Visual Marker Reaction
-        marker = ps.register_point_cloud("push_tool_marker", np.array([tool_center]))
-        if is_down:
-            marker.set_color((1.0, 0.4, 0.1))  # Glowing bright orange when active/pushing
-            marker.set_radius(push_radius * 0.4)
+            if np.any(inside):
+                for idx in np.where(inside)[0]:
+                    d = dists[idx]
+                    dir_vec = np.array([0.0, 1.0, 0.0]) if d < 1e-6 else vecs[idx] / d
+                    target_p = pusher_pos + dir_vec * push_radius
+                    body.velocities[idx] = (target_p - pos[idx]) / DT
+                    pos[idx] = target_p
         else:
-            marker.set_color((0.2, 0.9, 1.0))  # Bright cyan preview when hovering
-            marker.set_radius(0.03)
-
-        if tool_mode == 0:  # PUSHER TOOL MODE (Push/Repulse from any direction)
-            if is_down:
-                # Repulse all surface vertices within push_radius
-                vecs = pos - tool_center
-                dists_to_tool = np.linalg.norm(vecs, axis=1)
-                inside = dists_to_tool < push_radius
-
-                if np.any(inside):
-                    for idx in np.where(inside)[0]:
-                        d = dists_to_tool[idx]
-                        if d < 1e-6:
-                            dir_vec = np.array([0.0, 1.0, 0.0])  # Push upward if exactly centered
-                        else:
-                            dir_vec = vecs[idx] / d
-
-                        target_p = tool_center + dir_vec * push_radius
-                        # Give pushing velocity for fluid movement
-                        vel = (target_p - pos[idx]) / DT
-                        body.velocities[idx] = vel
-                        pos[idx] = target_p
-
-        elif tool_mode == 1:  # GRABBER TOOL MODE (Grab & Pull)
-            if is_down:
-                if grabbed_idx is None:
-                    if dists[min_idx] < 1.0 and not np.isnan(dists[min_idx]):
-                        grabbed_idx = int(min_idx)
-                        grabbed_depth = float(t_proj[min_idx])
-                        last_target_pos = pos[grabbed_idx].copy()
-                else:
-                    target_pos = ray_o + ray_d * grabbed_depth
-                    if not np.any(np.isnan(target_pos)):
-                        if last_target_pos is not None:
-                            vel = (target_pos - last_target_pos) / DT
-                            if not np.any(np.isnan(vel)):
-                                body.velocities[grabbed_idx] = vel
-                        pos[grabbed_idx] = target_pos
-                        last_target_pos = target_pos.copy()
-
-                        nodes = np.array([body.positions[grabbed_idx], target_pos])
-                        edges = np.array([[0, 1]])
-                        ps.register_curve_network("drag_line", nodes, edges, radius=0.02, color=(1.0, 0.1, 0.1))
-            else:
-                if grabbed_idx is not None:
-                    grabbed_idx = None
-                    last_target_pos = None
-                    ps.remove_curve_network("drag_line", error_if_absent=False)
+            marker.set_color((0.2, 0.9, 1.0))  # Cyan preview
+            marker.set_radius(0.04)
 
     def step_simulation() -> None:
         solver.step(DT)
@@ -472,13 +432,26 @@ def main() -> None:
             cloud.update_point_positions(body.positions[p_start:p_end])
 
     def frame() -> None:
-        nonlocal is_running, tool_mode, push_radius, push_depth_offset
+        nonlocal is_running, push_radius, pusher_pos
         import polyscope.imgui as imgui
 
         io = imgui.GetIO()
 
-        # Orbit camera when not actively pushing/grabbing
-        ps.set_do_default_mouse_interaction(not io.MouseDown[0])
+        # Update pusher position from screen ray if mouse clicked
+        is_down = bool(io.MouseDown[0])
+        try:
+            m_pos = io.MousePos
+            px = float(m_pos.x) if hasattr(m_pos, "x") else float(m_pos[0])
+            py = float(m_pos.y) if hasattr(m_pos, "y") else float(m_pos[1])
+            ray_o, ray_d = ps.screen_coords_to_world_ray((px, py))
+            if ray_o is not None and ray_d is not None and not np.any(np.isnan(ray_o)):
+                norm_d = np.linalg.norm(ray_d)
+                if norm_d > 1e-6:
+                    ray_d = ray_d / norm_d
+                    # Project pusher sphere to ray
+                    pusher_pos = ray_o + ray_d * 2.0
+        except Exception:
+            pass
 
         imgui.Text("Simulation Controls:")
         if imgui.Button("Reset / Restart"):
@@ -491,25 +464,31 @@ def main() -> None:
             step_simulation()
 
         imgui.Separator()
-        imgui.Text("3D Interactive Tools:")
-        changed_mode, tool_mode = imgui.RadioButton("3D Pusher (Push from top/bottom/sides)", tool_mode, 0)
+        imgui.Text("Instant Reaction Buttons (1-Click Physics):")
+        if imgui.Button("PUSH UP (Push from Bottom)"):
+            apply_push_up_force()
         imgui.SameLine()
-        _, tool_mode = imgui.RadioButton("Grabber (Pull)", tool_mode, 1)
+        if imgui.Button("SQUASH (Push from Top)"):
+            apply_squash_force()
+        imgui.SameLine()
+        if imgui.Button("POKE (Side Push)"):
+            apply_poke_force()
 
-        if tool_mode == 0:
-            imgui.TextColored((0.2, 1.0, 0.4, 1.0), "[3D Pusher Active] Left-click to push bags from ANY direction!")
-            _, push_radius = imgui.SliderFloat("Pusher Radius", push_radius, 0.1, 0.8)
-            _, push_depth_offset = imgui.SliderFloat("Pusher Height/Depth Offset", push_depth_offset, -0.5, 0.5)
-        else:
-            imgui.TextColored((1.0, 0.6, 0.2, 1.0), "[3D Grabber Active] Left-click & drag to pull bags!")
+        imgui.Separator()
+        imgui.Text("3D Pusher Tool (3D Sphere Interactor):")
+        _, push_radius = imgui.SliderFloat("Pusher Radius", push_radius, 0.1, 0.8)
+        _, pusher_pos[0] = imgui.SliderFloat("Pusher X (Left/Right)", pusher_pos[0], -1.0, 1.0)
+        _, pusher_pos[1] = imgui.SliderFloat("Pusher Y (Up/Down / Height)", pusher_pos[1], 0.0, 2.5)
+        _, pusher_pos[2] = imgui.SliderFloat("Pusher Z (Front/Back)", pusher_pos[2], -1.0, 1.0)
 
-        handle_mouse_interaction(io)
+        update_pusher_physics(is_down)
 
         if is_running:
             step_simulation()
 
     ps.set_user_callback(frame)
     ps.show()
+
 
 
 
