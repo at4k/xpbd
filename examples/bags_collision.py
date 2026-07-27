@@ -367,16 +367,23 @@ def main() -> None:
 
     def handle_mouse_interaction(io) -> None:
         nonlocal grabbed_idx, grabbed_depth, last_target_pos
-        mouse_pos = (io.MousePos.x, io.MousePos.y)
+        mouse_pos = (float(io.MousePos.x), float(io.MousePos.y))
         is_down = io.MouseDown[0]
 
-        # Convert screen mouse coordinate to 3D Ray
+        # Convert screen mouse coordinate to 3D Ray safely
         try:
             ray_o, ray_d = ps.screen_coords_to_world_ray(mouse_pos)
         except Exception:
             return
 
-        ray_d = ray_d / np.maximum(np.linalg.norm(ray_d), 1e-12)
+        if ray_o is None or ray_d is None or np.any(np.isnan(ray_o)) or np.any(np.isnan(ray_d)):
+            return
+
+        norm_d = np.linalg.norm(ray_d)
+        if norm_d < 1e-6 or np.isnan(norm_d):
+            return
+
+        ray_d = ray_d / norm_d
 
         if is_down and not io.WantCaptureMouse:
             if grabbed_idx is None:
@@ -388,23 +395,25 @@ def main() -> None:
                 dists = np.linalg.norm(pos - closest_pts, axis=1)
 
                 min_idx = np.argmin(dists)
-                if dists[min_idx] < 0.35:  # Within grab radius
+                if dists[min_idx] < 0.40 and not np.isnan(dists[min_idx]):  # Within grab radius
                     grabbed_idx = min_idx
                     grabbed_depth = t[min_idx]
                     last_target_pos = pos[min_idx].copy()
             else:
                 # Drag active grabbed vertex to new target position
                 target_pos = ray_o + ray_d * grabbed_depth
-                if last_target_pos is not None:
-                    vel = (target_pos - last_target_pos) / DT
-                    body.velocities[grabbed_idx] = vel
-                body.positions[grabbed_idx] = target_pos
-                last_target_pos = target_pos.copy()
+                if not np.any(np.isnan(target_pos)):
+                    if last_target_pos is not None:
+                        vel = (target_pos - last_target_pos) / DT
+                        if not np.any(np.isnan(vel)):
+                            body.velocities[grabbed_idx] = vel
+                    body.positions[grabbed_idx] = target_pos
+                    last_target_pos = target_pos.copy()
 
-                # Draw elastic drag line
-                nodes = np.array([body.positions[grabbed_idx], target_pos])
-                edges = np.array([[0, 1]])
-                ps.register_curve_network("drag_line", nodes, edges, radius=0.015, color=(1.0, 0.2, 0.2))
+                    # Draw elastic drag line
+                    nodes = np.array([body.positions[grabbed_idx], target_pos])
+                    edges = np.array([[0, 1]])
+                    ps.register_curve_network("drag_line", nodes, edges, radius=0.015, color=(1.0, 0.2, 0.2))
         else:
             if grabbed_idx is not None:
                 grabbed_idx = None
@@ -441,7 +450,9 @@ def main() -> None:
         if imgui.Button("Step"):
             step_simulation()
 
-        changed, drag_mode = imgui.Checkbox("Mouse Drag Mode (Grab & Throw Bags)", drag_mode)
+        res = imgui.Checkbox("Mouse Drag Mode (Grab & Throw Bags)", drag_mode)
+        drag_mode = res[1] if isinstance(res, tuple) else res
+
         if drag_mode:
             imgui.TextColored((0.4, 0.9, 0.4, 1.0), "Left-click & drag anywhere on a bag to grab and throw it!")
             handle_mouse_interaction(io)
@@ -453,6 +464,7 @@ def main() -> None:
 
     ps.set_user_callback(frame)
     ps.show()
+
 
 
 
