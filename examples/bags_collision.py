@@ -296,9 +296,14 @@ def main() -> None:
     init_velocities = body.velocities.copy()
 
     is_running = True
+    drag_mode = True
+    grabbed_idx = None
+    grabbed_depth = 0.0
+    last_target_pos = None
 
     def reset_simulation() -> None:
-        nonlocal is_running
+        nonlocal is_running, grabbed_idx
+        grabbed_idx = None
         body.positions[:] = init_positions.copy()
         body.velocities[:] = init_velocities.copy()
         solver.reset()
@@ -331,7 +336,7 @@ def main() -> None:
         color = colors[bag_idx % len(colors)]
         mesh.set_color(color)
         mesh.set_edge_width(1.0)
-        mesh.set_smooth_shade(True)  # Smooth shading for smooth appearance
+        mesh.set_smooth_shade(True)
         ps_meshes.append((mesh, s_start, s_end))
 
         if p_end > p_start:
@@ -349,7 +354,6 @@ def main() -> None:
                 continue
             surf_pos = pos[s_start:s_end]
             centroid = np.mean(surf_pos, axis=0)
-            # Average distance from centroid to surface vertices
             r_avg = np.mean(np.linalg.norm(surf_pos - centroid, axis=1))
             r_max_allowed = r_avg * 0.85
 
@@ -360,6 +364,52 @@ def main() -> None:
             if np.any(too_far):
                 scale = (r_max_allowed / np.maximum(dists[too_far], 1e-12))[:, None]
                 pos[p_start:p_end][too_far] = centroid + vecs[too_far] * scale
+
+    def handle_mouse_interaction(io) -> None:
+        nonlocal grabbed_idx, grabbed_depth, last_target_pos
+        mouse_pos = (io.MousePos.x, io.MousePos.y)
+        is_down = io.MouseDown[0]
+
+        # Convert screen mouse coordinate to 3D Ray
+        try:
+            ray_o, ray_d = ps.screen_coords_to_world_ray(mouse_pos)
+        except Exception:
+            return
+
+        ray_d = ray_d / np.maximum(np.linalg.norm(ray_d), 1e-12)
+
+        if is_down and not io.WantCaptureMouse:
+            if grabbed_idx is None:
+                # Find nearest surface vertex to ray
+                pos = body.positions
+                diff = pos - ray_o
+                t = np.maximum(0.0, np.dot(diff, ray_d))
+                closest_pts = ray_o + t[:, None] * ray_d
+                dists = np.linalg.norm(pos - closest_pts, axis=1)
+
+                min_idx = np.argmin(dists)
+                if dists[min_idx] < 0.35:  # Within grab radius
+                    grabbed_idx = min_idx
+                    grabbed_depth = t[min_idx]
+                    last_target_pos = pos[min_idx].copy()
+            else:
+                # Drag active grabbed vertex to new target position
+                target_pos = ray_o + ray_d * grabbed_depth
+                if last_target_pos is not None:
+                    vel = (target_pos - last_target_pos) / DT
+                    body.velocities[grabbed_idx] = vel
+                body.positions[grabbed_idx] = target_pos
+                last_target_pos = target_pos.copy()
+
+                # Draw elastic drag line
+                nodes = np.array([body.positions[grabbed_idx], target_pos])
+                edges = np.array([[0, 1]])
+                ps.register_curve_network("drag_line", nodes, edges, radius=0.015, color=(1.0, 0.2, 0.2))
+        else:
+            if grabbed_idx is not None:
+                grabbed_idx = None
+                last_target_pos = None
+                ps.remove_curve_network("drag_line", error_if_absent=False)
 
     def step_simulation() -> None:
         solver.step(DT)
@@ -373,10 +423,14 @@ def main() -> None:
             cloud.update_point_positions(body.positions[p_start:p_end])
 
     def frame() -> None:
-        nonlocal is_running
+        nonlocal is_running, drag_mode
         import polyscope.imgui as imgui
 
-        # UI panel for simulation controls
+        io = imgui.GetIO()
+
+        # Toggle camera vs mouse drag mode
+        ps.set_do_default_mouse_interaction(not drag_mode)
+
         imgui.Text("Simulation Controls:")
         if imgui.Button("Reset / Restart"):
             reset_simulation()
@@ -387,11 +441,19 @@ def main() -> None:
         if imgui.Button("Step"):
             step_simulation()
 
+        changed, drag_mode = imgui.Checkbox("Mouse Drag Mode (Grab & Throw Bags)", drag_mode)
+        if drag_mode:
+            imgui.TextColored((0.4, 0.9, 0.4, 1.0), "Left-click & drag anywhere on a bag to grab and throw it!")
+            handle_mouse_interaction(io)
+        else:
+            imgui.TextColored((0.7, 0.7, 0.7, 1.0), "Camera Orbit Mode active.")
+
         if is_running:
             step_simulation()
 
     ps.set_user_callback(frame)
     ps.show()
+
 
 
 
