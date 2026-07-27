@@ -294,56 +294,21 @@ def main() -> None:
     # Backup initial positions & velocities for instant reset
     is_running = True
     push_radius = 0.35
-    pusher_pos = np.array([0.0, 0.5, 0.0])
+    grabbed_idx = None
+    grabbed_depth = 2.0
 
     def reset_simulation() -> None:
-        nonlocal is_running
+        nonlocal is_running, grabbed_idx
+        grabbed_idx = None
         body.positions[:] = init_positions.copy()
         body.velocities[:] = init_velocities.copy()
         solver.reset()
         update_visuals()
 
 
-    def apply_push_up_force() -> None:
-        """Pushes bags from bottom upwards for instant visual reaction."""
-        pos = body.positions
-        for s_start, s_end in surf_vertex_ranges:
-            surf = pos[s_start:s_end]
-            centroid = np.mean(surf, axis=0)
-            bottom_mask = surf[:, 1] < centroid[1]
-            indices = np.arange(s_start, s_end)[bottom_mask]
-            body.velocities[indices, 1] += 4.5
-            body.positions[indices, 1] += 0.05
-        update_visuals()
-
-    def apply_squash_force() -> None:
-        """Squashes bags from top downwards for instant visual reaction."""
-        pos = body.positions
-        for s_start, s_end in surf_vertex_ranges:
-            surf = pos[s_start:s_end]
-            centroid = np.mean(surf, axis=0)
-            top_mask = surf[:, 1] > centroid[1]
-            indices = np.arange(s_start, s_end)[top_mask]
-            body.velocities[indices, 1] -= 4.5
-            body.positions[indices, 1] -= 0.05
-        update_visuals()
-
-    def apply_poke_force() -> None:
-        """Pokes bags horizontally with random impulses."""
-        pos = body.positions
-        np.random.seed()
-        for s_start, s_end in surf_vertex_ranges:
-            rand_dir = np.random.uniform(-1.0, 1.0, size=3)
-            rand_dir[1] = 0.2
-            rand_dir = rand_dir / np.linalg.norm(rand_dir)
-            indices = np.arange(s_start, s_end)
-            body.velocities[indices] += rand_dir * 3.5
-        update_visuals()
-
     ps.init()
     ps.set_ground_plane_mode("none")
     ps.set_up_dir("y_up")
-    ps.set_navigation_style("turntable")
     register_box_wireframe(bounds_min, bounds_max)
 
     ps_meshes = []
@@ -397,27 +362,68 @@ def main() -> None:
                 scale = (r_max_allowed / np.maximum(dists[too_far], 1e-12))[:, None]
                 pos[p_start:p_end][too_far] = centroid + vecs[too_far] * scale
 
-    def update_pusher_physics(is_active: bool) -> None:
-        pos = body.positions
-        vecs = pos - pusher_pos
-        dists = np.linalg.norm(vecs, axis=1)
-        inside = dists < push_radius
+    def handle_direct_mouse_drag(io) -> None:
+        nonlocal grabbed_idx, grabbed_depth
 
-        marker = ps.register_point_cloud("push_tool_marker", np.array([pusher_pos]))
-        if np.any(inside) or is_active:
-            marker.set_color((1.0, 0.3, 0.1))  # Bright glowing orange when active
-            marker.set_radius(push_radius * 0.45)
+        is_down = bool(io.MouseDown[0]) or bool(io.MouseDown[1])
 
-            if is_active or np.any(inside):
-                for idx in np.where(inside)[0]:
-                    d = dists[idx]
-                    dir_vec = np.array([0.0, 1.0, 0.0]) if d < 1e-6 else vecs[idx] / d
-                    target_p = pusher_pos + dir_vec * push_radius
-                    body.velocities[idx] = (target_p - pos[idx]) / DT
-                    pos[idx] = target_p
-        else:
-            marker.set_color((0.2, 0.9, 1.0))  # Cyan preview
-            marker.set_radius(0.04)
+        try:
+            m_pos = io.MousePos
+            px = float(m_pos.x) if hasattr(m_pos, "x") else float(m_pos[0])
+            py = float(m_pos.y) if hasattr(m_pos, "y") else float(m_pos[1])
+
+            ray_o, ray_d = ps.screen_coords_to_world_ray((px, py))
+            if ray_o is None or ray_d is None or np.any(np.isnan(ray_o)) or np.any(np.isnan(ray_d)):
+                return
+
+            norm_d = np.linalg.norm(ray_d)
+            if norm_d < 1e-6:
+                return
+            ray_d = ray_d / norm_d
+
+            pos = body.positions
+
+            if is_down:
+                if grabbed_idx is None:
+                    # Find nearest surface vertex to ray
+                    diff = pos - ray_o
+                    t_proj = np.maximum(0.0, np.dot(diff, ray_d))
+                    closest_pts = ray_o + t_proj[:, None] * ray_d
+                    dists = np.linalg.norm(pos - closest_pts, axis=1)
+                    min_idx = np.argmin(dists)
+
+                    if dists[min_idx] < 1.5:
+                        grabbed_idx = int(min_idx)
+                        grabbed_depth = float(t_proj[min_idx])
+                else:
+                    # Directly move grabbed vertex with mouse ray
+                    target_pos = ray_o + ray_d * grabbed_depth
+                    vel = (target_pos - pos[grabbed_idx]) / DT
+                    body.velocities[grabbed_idx] = vel
+                    pos[grabbed_idx] = target_pos
+
+                    # Also repulse surrounding vertices within push_radius
+                    vecs = pos - target_pos
+                    dists_to_target = np.linalg.norm(vecs, axis=1)
+                    inside = dists_to_target < push_radius
+                    for idx in np.where(inside)[0]:
+                        if idx != grabbed_idx:
+                            d = dists_to_target[idx]
+                            dir_vec = np.array([0.0, 1.0, 0.0]) if d < 1e-6 else vecs[idx] / d
+                            p_target = target_pos + dir_vec * push_radius
+                            body.velocities[idx] = (p_target - pos[idx]) / DT
+                            pos[idx] = p_target
+
+                    # Visual feedback marker
+                    marker = ps.register_point_cloud("mouse_grab_marker", np.array([target_pos]))
+                    marker.set_color((1.0, 0.3, 0.1))
+                    marker.set_radius(0.08)
+            else:
+                if grabbed_idx is not None:
+                    grabbed_idx = None
+                    ps.remove_point_cloud("mouse_grab_marker", error_if_absent=False)
+        except Exception:
+            pass
 
     def step_simulation() -> None:
         solver.step(DT)
@@ -431,78 +437,26 @@ def main() -> None:
             cloud.update_point_positions(body.positions[p_start:p_end])
 
     def frame() -> None:
-        nonlocal is_running, push_radius, pusher_pos
+        nonlocal is_running
         import polyscope.imgui as imgui
 
         io = imgui.GetIO()
 
-        # Keyboard WASD / Arrow Key controls for 3D Pusher Ball
-        step_move = 0.03
-        if hasattr(io, "KeysDown") and len(io.KeysDown) > 265:
-            if io.KeysDown[263]:  # Left Arrow
-                pusher_pos[0] -= step_move
-            if io.KeysDown[262]:  # Right Arrow
-                pusher_pos[0] += step_move
-            if io.KeysDown[265]:  # Up Arrow
-                pusher_pos[1] += step_move
-            if io.KeysDown[264]:  # Down Arrow
-                pusher_pos[1] -= step_move
+        # Handle direct mouse interaction every frame
+        handle_direct_mouse_drag(io)
 
-        imgui.Text("Simulation Controls:")
         if imgui.Button("Reset / Restart"):
             reset_simulation()
         imgui.SameLine()
         if imgui.Button("Pause" if is_running else "Play"):
             is_running = not is_running
-        imgui.SameLine()
-        if imgui.Button("Step"):
-            step_simulation()
-
-        imgui.Separator()
-        imgui.Text("1-Click Physics Reaction Buttons:")
-        if imgui.Button("PUSH UP (Push Bottom)"):
-            apply_push_up_force()
-        imgui.SameLine()
-        if imgui.Button("SQUASH (Push Top)"):
-            apply_squash_force()
-        imgui.SameLine()
-        if imgui.Button("POKE (Push Side)"):
-            apply_poke_force()
-
-        imgui.Separator()
-        imgui.Text("3D Touch Direction Controllers:")
-        if imgui.Button("  UP  "):
-            pusher_pos[1] += 0.1
-        imgui.SameLine()
-        if imgui.Button(" DOWN "):
-            pusher_pos[1] -= 0.1
-        imgui.SameLine()
-        if imgui.Button(" LEFT "):
-            pusher_pos[0] -= 0.1
-        imgui.SameLine()
-        if imgui.Button("RIGHT "):
-            pusher_pos[0] += 0.1
-        imgui.SameLine()
-        if imgui.Button(" FORWARD "):
-            pusher_pos[2] -= 0.1
-        imgui.SameLine()
-        if imgui.Button(" BACKWARD "):
-            pusher_pos[2] += 0.1
-
-        imgui.Separator()
-        imgui.Text("3D Pusher Sphere Position:")
-        _, push_radius = imgui.SliderFloat("Pusher Radius", push_radius, 0.1, 0.8)
-        _, pusher_pos[0] = imgui.SliderFloat("Pusher X (Left/Right)", pusher_pos[0], -1.0, 1.0)
-        _, pusher_pos[1] = imgui.SliderFloat("Pusher Y (Up/Down / Height)", pusher_pos[1], 0.0, 2.5)
-        _, pusher_pos[2] = imgui.SliderFloat("Pusher Z (Front/Back)", pusher_pos[2], -1.0, 1.0)
-
-        update_pusher_physics(True)
 
         if is_running:
             step_simulation()
 
     ps.set_user_callback(frame)
     ps.show()
+
 
 
 
