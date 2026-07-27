@@ -439,10 +439,12 @@ def main() -> None:
 
         io = imgui.GetIO()
 
-        is_down = bool(io.MouseDown[0])
+        # Check Right-Click (MouseDown[1]) or Shift+Left-Click for object pushing
+        is_right_down = bool(io.MouseDown[1]) if len(io.MouseDown) > 1 else False
+        is_shift_left = bool(io.MouseDown[0]) and io.KeyShift
+        is_active_push = is_right_down or is_shift_left
 
         if direct_mouse_push:
-            # Mouse Wheel adjusts pusher depth in 3D space
             if abs(io.MouseWheel) > 0.01:
                 pusher_depth += io.MouseWheel * 0.15
 
@@ -451,7 +453,6 @@ def main() -> None:
                 px = float(m_pos.x) if hasattr(m_pos, "x") else float(m_pos[0])
                 py = float(m_pos.y) if hasattr(m_pos, "y") else float(m_pos[1])
 
-                # Convert screen mouse coordinate to 3D ray
                 ray_o, ray_d = ps.screen_coords_to_world_ray((px, py))
 
                 if ray_o is not None and ray_d is not None and not np.any(np.isnan(ray_o)):
@@ -459,7 +460,6 @@ def main() -> None:
                     if norm_d > 1e-6:
                         ray_d = ray_d / norm_d
 
-                        # Check nearest object hit for auto depth snapping
                         pos = body.positions
                         diff = pos - ray_o
                         t_proj = np.maximum(0.0, np.dot(diff, ray_d))
@@ -467,11 +467,9 @@ def main() -> None:
                         dists = np.linalg.norm(pos - closest_pts, axis=1)
                         min_idx = np.argmin(dists)
 
-                        if dists[min_idx] < 1.2 and not is_down:
-                            # Auto-snap depth to nearest object surface when hovering
+                        if dists[min_idx] < 1.2 and not is_active_push:
                             pusher_depth = float(t_proj[min_idx])
 
-                        # Project 3D Pusher sphere to current mouse ray
                         pusher_pos = ray_o + ray_d * pusher_depth
             except Exception:
                 pass
@@ -487,39 +485,40 @@ def main() -> None:
             step_simulation()
 
         imgui.Separator()
-        imgui.Text("Instant Reaction Buttons (1-Click Physics):")
-        if imgui.Button("PUSH UP (Push from Bottom)"):
+        imgui.Text("1-Click Physics Buttons:")
+        if imgui.Button("PUSH UP (Push Bottom)"):
             apply_push_up_force()
         imgui.SameLine()
-        if imgui.Button("SQUASH (Push from Top)"):
+        if imgui.Button("SQUASH (Push Top)"):
             apply_squash_force()
         imgui.SameLine()
-        if imgui.Button("POKE (Side Push)"):
+        if imgui.Button("POKE (Push Side)"):
             apply_poke_force()
 
         imgui.Separator()
-        imgui.Text("Direct Mouse 3D Pusher:")
-        res_push = imgui.Checkbox("Direct Mouse Control (Move Mouse to Push Bags)", direct_mouse_push)
+        imgui.TextColored((1.0, 0.9, 0.2, 1.0), "Mouse Controls Guide:")
+        imgui.TextColored((0.7, 0.7, 0.7, 1.0), "Camera Orbit (Rotate Scene): Left-Click & Drag")
+        imgui.TextColored((0.2, 1.0, 0.4, 1.0), "Push/Interact Bags:          RIGHT-CLICK & Drag (or Shift+Left-Click)")
+        imgui.TextColored((0.9, 0.6, 0.2, 1.0), "Adjust Height/Depth:         Mouse Wheel")
+
+        imgui.Separator()
+        res_push = imgui.Checkbox("Direct Mouse Pusher Active", direct_mouse_push)
         direct_mouse_push = res_push[1] if isinstance(res_push, tuple) else res_push
 
-        if direct_mouse_push:
-            imgui.TextColored((0.2, 1.0, 0.4, 1.0), "Mouse Active: Move mouse to position 3D Marker, Left-click/Drag to Push!")
-            imgui.TextColored((0.8, 0.8, 0.2, 1.0), "Use Mouse Wheel to adjust Pusher Depth/Height forward & backward.")
-        else:
-            imgui.TextColored((0.7, 0.7, 0.7, 1.0), "Manual Slider Control Active.")
-
         _, push_radius = imgui.SliderFloat("Pusher Radius", push_radius, 0.1, 0.8)
-        _, pusher_pos[0] = imgui.SliderFloat("Pusher X (Left/Right)", pusher_pos[0], -1.0, 1.0)
-        _, pusher_pos[1] = imgui.SliderFloat("Pusher Y (Up/Down / Height)", pusher_pos[1], 0.0, 2.5)
-        _, pusher_pos[2] = imgui.SliderFloat("Pusher Z (Front/Back)", pusher_pos[2], -1.0, 1.0)
+        _, pusher_pos[0] = imgui.SliderFloat("Pusher X", pusher_pos[0], -1.0, 1.0)
+        _, pusher_pos[1] = imgui.SliderFloat("Pusher Y", pusher_pos[1], 0.0, 2.5)
+        _, pusher_pos[2] = imgui.SliderFloat("Pusher Z", pusher_pos[2], -1.0, 1.0)
 
-        update_pusher_physics(is_down)
+        update_pusher_physics(is_active_push)
 
         if is_running:
             step_simulation()
 
     ps.set_user_callback(frame)
     ps.show()
+
+
 
 
 
