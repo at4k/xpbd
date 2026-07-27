@@ -295,10 +295,9 @@ def main() -> None:
     init_positions = body.positions.copy()
     init_velocities = body.velocities.copy()
 
-    is_running = True
+    nav_mode = 0  # 0: Mouse Physics Push Mode (Camera Locked), 1: Camera Orbit Mode
     push_radius = 0.35
     pusher_depth = 2.0
-    direct_mouse_push = True
     pusher_pos = np.array([0.0, 0.5, 0.0])
 
     def reset_simulation() -> None:
@@ -347,6 +346,7 @@ def main() -> None:
     ps.init()
     ps.set_ground_plane_mode("none")
     ps.set_up_dir("y_up")
+    ps.set_navigation_style("none")  # Start in Pure Mouse Physics Push Mode
     register_box_wireframe(bounds_min, bounds_max)
 
     ps_meshes = []
@@ -433,32 +433,15 @@ def main() -> None:
         for cloud, p_start, p_end in ps_clouds:
             cloud.update_point_positions(body.positions[p_start:p_end])
 
-    prev_space_state = False
-
     def frame() -> None:
-        nonlocal is_running, push_radius, pusher_pos, pusher_depth, direct_mouse_push, prev_space_state
+        nonlocal is_running, push_radius, pusher_pos, pusher_depth, nav_mode
         import polyscope.imgui as imgui
 
         io = imgui.GetIO()
 
-        # Check Space key (ASCII 32) status for camera lock
-        is_space_pressed = False
-        try:
-            if hasattr(io, "KeysDown") and len(io.KeysDown) > 32:
-                is_space_pressed = bool(io.KeysDown[32])
-        except Exception:
-            pass
-
-        # Switch camera interaction state ONLY when Space key status changes
-        if is_space_pressed != prev_space_state:
-            ps.set_do_default_mouse_interaction(not is_space_pressed)
-            prev_space_state = is_space_pressed
-
         is_down = bool(io.MouseDown[0])
-        # Direct mouse physics interaction is active when Space is held or left-click is active in Space mode
-        is_active_push = is_space_pressed and is_down
 
-        if direct_mouse_push:
+        if nav_mode == 0:  # Pure Mouse Push Mode (Camera Locked)
             if abs(io.MouseWheel) > 0.01:
                 pusher_depth += io.MouseWheel * 0.15
 
@@ -481,7 +464,7 @@ def main() -> None:
                         dists = np.linalg.norm(pos - closest_pts, axis=1)
                         min_idx = np.argmin(dists)
 
-                        if dists[min_idx] < 1.2 and not is_active_push:
+                        if dists[min_idx] < 1.2 and not is_down:
                             pusher_depth = float(t_proj[min_idx])
 
                         pusher_pos = ray_o + ray_d * pusher_depth
@@ -510,28 +493,37 @@ def main() -> None:
             apply_poke_force()
 
         imgui.Separator()
-        imgui.TextColored((1.0, 0.9, 0.2, 1.0), "Mouse Interaction Mode:")
-        if is_space_pressed:
-            imgui.TextColored((0.2, 1.0, 0.4, 1.0), ">>> [PHYSICS PUSH ACTIVE] Camera Locked. Drag Mouse to Push Bags! <<<")
+        imgui.Text("Mode Selection:")
+        changed_0, nav_mode = imgui.RadioButton("Mouse Physics Push Mode (Camera Locked)", nav_mode, 0)
+        imgui.SameLine()
+        changed_1, nav_mode = imgui.RadioButton("Camera Rotate Mode", nav_mode, 1)
+
+        if changed_0 or changed_1:
+            if nav_mode == 0:
+                ps.set_navigation_style("none")
+            else:
+                ps.set_navigation_style("turntable")
+
+        if nav_mode == 0:
+            imgui.TextColored((0.2, 1.0, 0.4, 1.0), ">>> MOUSE PUSH MODE ACTIVE <<<")
+            imgui.TextColored((0.8, 0.8, 0.2, 1.0), "Left-Click & Drag to PUSH bags directly. Mouse Wheel adjusts height/depth.")
         else:
-            imgui.TextColored((0.7, 0.7, 0.7, 1.0), "[Camera Orbit Mode] Hold SPACE KEY & Drag Mouse to Push Bags!")
+            imgui.TextColored((0.7, 0.7, 0.7, 1.0), ">>> CAMERA ROTATE MODE ACTIVE <<< Drag mouse to rotate view.")
 
         imgui.Separator()
-        res_push = imgui.Checkbox("Direct Mouse Pusher Active", direct_mouse_push)
-        direct_mouse_push = res_push[1] if isinstance(res_push, tuple) else res_push
-
         _, push_radius = imgui.SliderFloat("Pusher Radius", push_radius, 0.1, 0.8)
         _, pusher_pos[0] = imgui.SliderFloat("Pusher X", pusher_pos[0], -1.0, 1.0)
         _, pusher_pos[1] = imgui.SliderFloat("Pusher Y", pusher_pos[1], 0.0, 2.5)
         _, pusher_pos[2] = imgui.SliderFloat("Pusher Z", pusher_pos[2], -1.0, 1.0)
 
-        update_pusher_physics(is_active_push)
+        update_pusher_physics(is_down if nav_mode == 0 else False)
 
         if is_running:
             step_simulation()
 
     ps.set_user_callback(frame)
     ps.show()
+
 
 
 
