@@ -35,6 +35,7 @@ class GlobalVolumeConstraint:
         faces_list: list[np.ndarray] | np.ndarray,
         compliance: float = 0.0,
         relaxation: float = 1.0,
+        inflation_factor: float = 1.0,
     ) -> "GlobalVolumeConstraint":
         if isinstance(faces_list, np.ndarray):
             flist = [faces_list]
@@ -47,7 +48,7 @@ class GlobalVolumeConstraint:
             p2 = positions[faces[:, 1]]
             p3 = positions[faces[:, 2]]
             vol = np.sum(np.einsum("ij,ij->i", np.cross(p1, p2), p3)) / 6.0
-            rest.append(vol)
+            rest.append(vol * inflation_factor)
 
         return cls(flist, rest, compliance=compliance, relaxation=relaxation)
 

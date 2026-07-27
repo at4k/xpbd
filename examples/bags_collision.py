@@ -26,13 +26,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-bags", type=int, default=4)
     parser.add_argument("--subdivisions", type=int, default=3)
     parser.add_argument("--bag-radius", type=float, default=0.45)
-    parser.add_argument("--particle-radius", type=float, default=0.04)
-    parser.add_argument("--edge-compliance", type=float, default=1e-4)
-    parser.add_argument("--volume-compliance", type=float, default=1e-3)
+    parser.add_argument("--particle-radius", type=float, default=0.0)
+    parser.add_argument("--inflation-factor", type=float, default=1.15)
+    parser.add_argument("--edge-compliance", type=float, default=1e-3)
+    parser.add_argument("--volume-compliance", type=float, default=0.0)
     parser.add_argument("--relaxation", type=float, default=1.0)
-    parser.add_argument("--substeps", type=int, default=25)
+    parser.add_argument("--substeps", type=int, default=35)
+    parser.add_argument("--no-self-collision", action="store_true", help="Disable self-collision for each bag")
     parser.add_argument(
-        "--mode", choices=["jacobi", "gauss_seidel"], default="jacobi"
+        "--mode", choices=["jacobi", "gauss_seidel"], default="gauss_seidel"
     )
     return parser.parse_args()
 
@@ -108,6 +110,22 @@ def build_solver(
 
     body, faces_list, group_ids, vertex_ranges = combine_bags(bags_data)
 
+    # Automatically calculate particle collision radius if not specified
+    if args.particle_radius <= 0.0:
+        # Calculate average edge length of first bag to make the surface watertight
+        first_pos, first_faces = bags_data[0]
+        from xpbd.mesh import edges_from_faces
+        first_edges = edges_from_faces(first_faces)
+        edge_diffs = first_pos[first_edges[:, 1]] - first_pos[first_edges[:, 0]]
+        edge_lengths = np.linalg.norm(edge_diffs, axis=1)
+        avg_edge_length = np.mean(edge_lengths)
+        # Having radius >= avg_edge_length * 0.6 ensures that spheres of adjacent vertices touch/overlap,
+        # preventing any vertex from slipping through the triangular faces while avoiding self-collision buckling!
+        p_radius = avg_edge_length * 0.60
+        print(f"Auto-calculated watertight particle collision radius: {p_radius:.4f} (avg edge length: {avg_edge_length:.4f})")
+    else:
+        p_radius = args.particle_radius
+
     constraints = [
         # 1. Distance constraints to keep the surface structure
         DistanceConstraint.from_positions(
@@ -122,12 +140,15 @@ def build_solver(
             faces_list,
             compliance=args.volume_compliance,
             relaxation=args.relaxation,
+            inflation_factor=args.inflation_factor,
         ),
-        # 3. Particle-to-particle collision handling
+        # 3. Particle-to-particle collision handling (with self-collision and neighbor filtering enabled)
         ParticleCollisionConstraint(
             len(body.positions),
-            radius=args.particle_radius,
+            radius=p_radius,
+            edges=body.edges,
             group_ids=group_ids,
+            self_collision=not args.no_self_collision,
         ),
         # 4. Box container boundaries
         BoxConstraint(len(body.positions), bounds_min, bounds_max),

@@ -63,11 +63,11 @@ def test_particle_collision():
 
 
 def test_particle_collision_group_ids():
-    # Overlapping particles, but with the same group_id (no collision expected)
+    # Overlapping particles, but with the same group_id (no collision expected when self_collision is False)
     x = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]], dtype=np.float64)
     inv_mass = np.ones(2)
     con = ParticleCollisionConstraint(
-        n_vertices=2, radius=0.1, group_ids=np.array([1, 1])
+        n_vertices=2, radius=0.1, group_ids=np.array([1, 1]), self_collision=False
     )
 
     con.project(x, inv_mass, h=0.01)
