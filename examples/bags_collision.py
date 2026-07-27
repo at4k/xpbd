@@ -1,9 +1,3 @@
-"""Demo simulating soft cells/bags colliding and deforming in a confined 3D container.
-
-Run: uv run --extra viz python examples/bags_collision.py
-Adjust compliance, substeps, and number of bags via CLI flags.
-"""
-
 import argparse
 
 import numpy as np
@@ -15,8 +9,10 @@ from xpbd.constraints import (
     DistanceConstraint,
     GlobalVolumeConstraint,
     ParticleCollisionConstraint,
+    VolumeConstraint,
 )
-from xpbd.mesh import sphere_mesh
+from xpbd.mesh import edges_from_faces, edges_from_tets, icosphere_mesh, sphere_mesh, sphere_tet_mesh
+
 
 DT = 1.0 / 60.0
 
@@ -24,140 +20,225 @@ DT = 1.0 / 60.0
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num-bags", type=int, default=4)
-    parser.add_argument("--subdivisions", type=int, default=3)
+    parser.add_argument("--subdivisions", type=int, default=2)
     parser.add_argument("--bag-radius", type=float, default=0.45)
     parser.add_argument("--particle-radius", type=float, default=0.0)
-    parser.add_argument("--inflation-factor", type=float, default=1.15)
-    parser.add_argument("--edge-compliance", type=float, default=1e-3)
+    parser.add_argument("--inflation-factor", type=float, default=1.0)
+    parser.add_argument("--edge-compliance", type=float, default=0.0)  # Rigid edges for smooth surface
     parser.add_argument("--volume-compliance", type=float, default=0.0)
     parser.add_argument("--relaxation", type=float, default=1.0)
-    parser.add_argument("--substeps", type=int, default=35)
+    parser.add_argument("--substeps", type=int, default=20)
     parser.add_argument("--no-self-collision", action="store_true", help="Disable self-collision for each bag")
     parser.add_argument(
-        "--mode", choices=["jacobi", "gauss_seidel"], default="gauss_seidel"
+        "--mesh-type", choices=["icosphere", "tet_sphere", "cube_sphere"], default="icosphere",
+        help="icosphere (uniform surface), tet_sphere (3D tetrahedral mesh), cube_sphere (legacy)"
+    )
+    parser.add_argument(
+        "--internal-particles", type=int, default=15,
+        help="Number of internal fluid particles per bag (0 to disable)"
+    )
+    parser.add_argument(
+        "--mode", choices=["jacobi", "gauss_seidel"], default="jacobi",
+        help="jacobi mode is vectorized and dramatically faster"
     )
     return parser.parse_args()
 
 
-def combine_bags(
-    bags_data: list[tuple[np.ndarray, np.ndarray]]
-) -> tuple[SoftBody, list[np.ndarray], np.ndarray, list[tuple[int, int]]]:
-    """Combines multiple (positions, faces) into a single SoftBody and returns tracking lists."""
-    all_positions = []
-    all_edges = []
-    all_inv_mass = []
 
-    faces_list = []
-    group_ids_list = []
-    vertex_ranges = []
+def generate_internal_particles(
+    origin: tuple[float, float, float],
+    radius: float,
+    num_particles: int,
+) -> np.ndarray:
+    """Generates internal fluid particles inside a safe inner sphere to avoid initial overlaps."""
+    if num_particles <= 0:
+        return np.zeros((0, 3), dtype=np.float64)
 
-    vertex_offset = 0
-    for bag_idx, (pos, faces) in enumerate(bags_data):
-        n_verts = len(pos)
+    # Fill within 45% radius of sphere to maintain clear safety gap from shell
+    r_max = radius * 0.45
 
-        temp_body = SoftBody.from_surface_mesh(pos, faces)
+    side = int(np.ceil(num_particles ** (1.0 / 3.0)))
+    if side < 2:
+        side = 2
+    grid_1d = np.linspace(-r_max, r_max, side)
+    gx, gy, gz = np.meshgrid(grid_1d, grid_1d, grid_1d, indexing="ij")
+    pts = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3)
 
-        all_positions.append(temp_body.positions)
-        all_edges.append(temp_body.edges + vertex_offset)
-        all_inv_mass.append(temp_body.inv_mass)
+    dists = np.linalg.norm(pts, axis=1)
+    inside = pts[dists <= r_max]
 
-        shifted_faces = faces + vertex_offset
-        faces_list.append(shifted_faces)
+    if len(inside) > num_particles:
+        indices = np.linspace(0, len(inside) - 1, num_particles, dtype=int)
+        inside = inside[indices]
+    elif len(inside) < num_particles:
+        np.random.seed(123)
+        while len(inside) < num_particles:
+            vec = np.random.uniform(-r_max, r_max, size=(num_particles * 2, 3))
+            norms = np.linalg.norm(vec, axis=1)
+            valid = vec[norms <= r_max]
+            inside = np.concatenate([inside, valid], axis=0)[:num_particles]
 
-        group_ids_list.append(np.full(n_verts, bag_idx, dtype=np.int64))
-        vertex_ranges.append((vertex_offset, vertex_offset + n_verts))
-
-        vertex_offset += n_verts
-
-    combined_positions = np.concatenate(all_positions, axis=0)
-    combined_edges = np.concatenate(all_edges, axis=0)
-    combined_inv_mass = np.concatenate(all_inv_mass, axis=0)
-    group_ids = np.concatenate(group_ids_list, axis=0)
-
-    combined_body = SoftBody(
-        positions=combined_positions,
-        velocities=np.zeros_like(combined_positions),
-        inv_mass=combined_inv_mass,
-        tets=np.zeros((0, 4), dtype=np.int64),
-        edges=combined_edges,
-    )
-
-    return combined_body, faces_list, group_ids, vertex_ranges
+    return inside + np.asarray(origin, dtype=np.float64)
 
 
 def build_solver(
     args: argparse.Namespace,
     bounds_min: tuple[float, float, float],
     bounds_max: tuple[float, float, float],
-) -> tuple[Solver, list[np.ndarray], list[tuple[int, int]]]:
-    # Generate initial positions and faces for multiple bags
-    bags_data = []
+) -> tuple[Solver, list[np.ndarray], list[tuple[int, int]], list[tuple[int, int]]]:
+    all_positions = []
+    all_edges = []
+    all_tets = []
+    all_inv_mass = []
+    all_radii = []
+    faces_list = []
+    group_ids_list = []
 
-    # Simple layout strategy: stack them vertically with slight horizontal offsets
+    surf_vertex_ranges = []
+    particle_vertex_ranges = []
+
     np.random.seed(42)
-    for i in range(args.num_bags):
-        # Slightly randomized initial centroids inside the upper part of the box
+    vertex_offset = 0
+
+    for bag_idx in range(args.num_bags):
         cx = np.random.uniform(-0.3, 0.3)
-        cy = 0.5 + i * (args.bag_radius * 1.8)
+        cy = 0.5 + bag_idx * (args.bag_radius * 1.8)
         cz = np.random.uniform(-0.3, 0.3)
+        origin = (cx, cy, cz)
 
-        pos, faces = sphere_mesh(
-            subdivisions=args.subdivisions,
-            radius=args.bag_radius,
-            origin=(cx, cy, cz),
-        )
-        bags_data.append((pos, faces))
+        if args.mesh_type == "tet_sphere":
+            surf_pos, faces, tets = sphere_tet_mesh(
+                subdivisions=args.subdivisions,
+                radius=args.bag_radius,
+                origin=origin,
+            )
+            n_surf = len(surf_pos)
+            surf_edges = edges_from_tets(tets)
+            shifted_tets = tets + vertex_offset
+            all_tets.append(shifted_tets)
+            internal_pos = np.zeros((0, 3), dtype=np.float64)
+            n_internal = 0
+        else:
+            if args.mesh_type == "icosphere":
+                surf_pos, faces = icosphere_mesh(
+                    subdivisions=args.subdivisions,
+                    radius=args.bag_radius,
+                    origin=origin,
+                )
+            else:
+                surf_pos, faces = sphere_mesh(
+                    subdivisions=args.subdivisions,
+                    radius=args.bag_radius,
+                    origin=origin,
+                )
+            n_surf = len(surf_pos)
+            surf_edges = edges_from_faces(faces)
+            internal_pos = generate_internal_particles(
+                origin, args.bag_radius, args.internal_particles
+            )
+            n_internal = len(internal_pos)
 
-    body, faces_list, group_ids, vertex_ranges = combine_bags(bags_data)
+        edge_diffs = surf_pos[surf_edges[:, 1]] - surf_pos[surf_edges[:, 0]]
+        avg_edge_len = np.mean(np.linalg.norm(edge_diffs, axis=1))
 
-    # Automatically calculate particle collision radius if not specified
-    if args.particle_radius <= 0.0:
-        # Calculate average edge length of first bag to make the surface watertight
-        first_pos, first_faces = bags_data[0]
-        from xpbd.mesh import edges_from_faces
-        first_edges = edges_from_faces(first_faces)
-        edge_diffs = first_pos[first_edges[:, 1]] - first_pos[first_edges[:, 0]]
-        edge_lengths = np.linalg.norm(edge_diffs, axis=1)
-        avg_edge_length = np.mean(edge_lengths)
-        # Having radius >= avg_edge_length * 0.6 ensures that spheres of adjacent vertices touch/overlap,
-        # preventing any vertex from slipping through the triangular faces while avoiding self-collision buckling!
-        p_radius = avg_edge_length * 0.60
-        print(f"Auto-calculated watertight particle collision radius: {p_radius:.4f} (avg edge length: {avg_edge_length:.4f})")
-    else:
-        p_radius = args.particle_radius
+        r_surf = avg_edge_len * 0.70 if args.particle_radius <= 0 else args.particle_radius
+        r_int = avg_edge_len * 0.50 if args.particle_radius <= 0 else args.particle_radius
+
+        total_bag_pos = np.concatenate([surf_pos, internal_pos], axis=0) if n_internal > 0 else surf_pos
+
+        all_positions.append(total_bag_pos)
+        all_edges.append(surf_edges + vertex_offset)
+
+        # Give internal fluid particles slightly lower mass impact so shell stays smooth
+        inv_mass = np.ones(len(total_bag_pos), dtype=np.float64)
+        if n_internal > 0:
+            inv_mass[n_surf:] = 2.0  # lighter fluid particles
+        all_inv_mass.append(inv_mass)
+
+        bag_radii = np.empty(len(total_bag_pos), dtype=np.float64)
+        bag_radii[:n_surf] = r_surf
+        if n_internal > 0:
+            bag_radii[n_surf:] = r_int
+        all_radii.append(bag_radii)
+
+        shifted_faces = faces + vertex_offset
+        faces_list.append(shifted_faces)
+
+        group_ids_list.append(np.full(len(total_bag_pos), bag_idx, dtype=np.int64))
+
+        surf_start = vertex_offset
+        surf_end = vertex_offset + n_surf
+        internal_start = surf_end
+        internal_end = surf_end + n_internal
+
+        surf_vertex_ranges.append((surf_start, surf_end))
+        particle_vertex_ranges.append((internal_start, internal_end))
+
+        vertex_offset += len(total_bag_pos)
+
+    combined_positions = np.concatenate(all_positions, axis=0)
+    combined_edges = np.concatenate(all_edges, axis=0)
+    combined_inv_mass = np.concatenate(all_inv_mass, axis=0)
+    combined_radii = np.concatenate(all_radii, axis=0)
+    group_ids = np.concatenate(group_ids_list, axis=0)
+    combined_tets = np.concatenate(all_tets, axis=0) if len(all_tets) > 0 else np.zeros((0, 4), dtype=np.int64)
+
+    combined_body = SoftBody(
+        positions=combined_positions,
+        velocities=np.zeros_like(combined_positions),
+        inv_mass=combined_inv_mass,
+        tets=combined_tets,
+        edges=combined_edges,
+    )
 
     constraints = [
-        # 1. Distance constraints to keep the surface structure
+        # 1. Distance constraints for surface mesh (rigid compliance 0.0 for smooth surface)
         DistanceConstraint.from_positions(
-            body.positions,
-            body.edges,
+            combined_body.positions,
+            combined_body.edges,
             compliance=args.edge_compliance,
             relaxation=args.relaxation,
         ),
-        # 2. Global volume constraints to keep bags inflated
+        # 2. Global volume constraint for surface meshes
         GlobalVolumeConstraint.from_positions(
-            body.positions,
+            combined_body.positions,
             faces_list,
             compliance=args.volume_compliance,
             relaxation=args.relaxation,
             inflation_factor=args.inflation_factor,
         ),
-        # 3. Particle-to-particle collision handling (with self-collision and neighbor filtering enabled)
+    ]
+
+    if len(combined_tets) > 0:
+        constraints.append(
+            VolumeConstraint.from_positions(
+                combined_body.positions,
+                combined_tets,
+                compliance=args.volume_compliance,
+                relaxation=args.relaxation,
+            )
+        )
+
+    constraints.extend([
+        # 3. Particle collisions with watertight radii
         ParticleCollisionConstraint(
-            len(body.positions),
-            radius=p_radius,
-            edges=body.edges,
+            len(combined_body.positions),
+            radius=combined_radii,
+            edges=combined_body.edges,
             group_ids=group_ids,
             self_collision=not args.no_self_collision,
         ),
-        # 4. Box container boundaries
-        BoxConstraint(len(body.positions), bounds_min, bounds_max),
-    ]
+        # 4. Box container boundary
+        BoxConstraint(len(combined_body.positions), bounds_min, bounds_max),
+    ])
 
     solver = Solver(
-        body, constraints, n_substeps=args.substeps, mode=args.mode
+        combined_body, constraints, n_substeps=args.substeps, mode=args.mode
     )
-    return solver, faces_list, vertex_ranges
+    return solver, faces_list, surf_vertex_ranges, particle_vertex_ranges
+
+
+
 
 
 def register_box_wireframe(
@@ -183,15 +264,15 @@ def register_box_wireframe(
             [0, 1],
             [1, 2],
             [2, 3],
-            [3, 0],  # bottom
+            [3, 0],
             [4, 5],
             [5, 6],
             [6, 7],
-            [7, 4],  # top
+            [7, 4],
             [0, 4],
             [1, 5],
             [2, 6],
-            [3, 7],  # columns
+            [3, 7],
         ]
     )
     ps.register_curve_network(
@@ -202,53 +283,117 @@ def register_box_wireframe(
 def main() -> None:
     args = parse_args()
 
-    # Define container limits
     bounds_min = (-1.0, 0.0, -1.0)
     bounds_max = (1.0, 3.0, 1.0)
 
-    solver, faces_list, vertex_ranges = build_solver(
+    solver, faces_list, surf_vertex_ranges, particle_vertex_ranges = build_solver(
         args, bounds_min, bounds_max
     )
     body = solver.body
+
+    # Backup initial positions & velocities for instant reset
+    init_positions = body.positions.copy()
+    init_velocities = body.velocities.copy()
+
+    is_running = True
+
+    def reset_simulation() -> None:
+        nonlocal is_running
+        body.positions[:] = init_positions.copy()
+        body.velocities[:] = init_velocities.copy()
+        solver.reset()
+        update_visuals()
 
     ps.init()
     ps.set_ground_plane_mode("none")
     ps.set_up_dir("y_up")
     register_box_wireframe(bounds_min, bounds_max)
 
-    # Register each bag as a separate Polyscope surface mesh for clear, colored visualization
     ps_meshes = []
+    ps_clouds = []
     colors = [
-        (0.85, 0.35, 0.25),  # reddish coral
-        (0.25, 0.65, 0.85),  # sky blue
-        (0.35, 0.75, 0.45),  # soft green
-        (0.85, 0.75, 0.25),  # soft yellow
-        (0.65, 0.35, 0.85),  # lavender purple
-        (0.85, 0.55, 0.25),  # soft orange
+        (0.85, 0.35, 0.25),
+        (0.25, 0.65, 0.85),
+        (0.35, 0.75, 0.45),
+        (0.85, 0.75, 0.25),
+        (0.65, 0.35, 0.85),
+        (0.85, 0.55, 0.25),
     ]
 
-    for bag_idx, (faces, (start, end)) in enumerate(
-        zip(faces_list, vertex_ranges)
+    for bag_idx, (faces, (s_start, s_end), (p_start, p_end)) in enumerate(
+        zip(faces_list, surf_vertex_ranges, particle_vertex_ranges)
     ):
         bag_name = f"bag_{bag_idx}"
-        # Shift faces to reference local vertices for registration
-        local_faces = faces - start
-        local_pos = body.positions[start:end]
+        local_faces = faces - s_start
+        local_pos = body.positions[s_start:s_end]
 
         mesh = ps.register_surface_mesh(bag_name, local_pos, local_faces)
         color = colors[bag_idx % len(colors)]
         mesh.set_color(color)
         mesh.set_edge_width(1.0)
-        ps_meshes.append((mesh, start, end))
+        mesh.set_smooth_shade(True)  # Smooth shading for smooth appearance
+        ps_meshes.append((mesh, s_start, s_end))
+
+        if p_end > p_start:
+            cloud_name = f"particles_{bag_idx}"
+            cloud = ps.register_point_cloud(cloud_name, body.positions[p_start:p_end])
+            cloud.set_color(color)
+            cloud.set_radius(0.010)
+            ps_clouds.append((cloud, p_start, p_end))
+
+    def clamp_internal_particles() -> None:
+        """Enforces that internal fluid particles strictly stay inside their corresponding bag's outer shell."""
+        pos = body.positions
+        for (s_start, s_end), (p_start, p_end) in zip(surf_vertex_ranges, particle_vertex_ranges):
+            if p_end <= p_start:
+                continue
+            surf_pos = pos[s_start:s_end]
+            centroid = np.mean(surf_pos, axis=0)
+            # Average distance from centroid to surface vertices
+            r_avg = np.mean(np.linalg.norm(surf_pos - centroid, axis=1))
+            r_max_allowed = r_avg * 0.85
+
+            part_pos = pos[p_start:p_end]
+            vecs = part_pos - centroid
+            dists = np.linalg.norm(vecs, axis=1)
+            too_far = dists > r_max_allowed
+            if np.any(too_far):
+                scale = (r_max_allowed / np.maximum(dists[too_far], 1e-12))[:, None]
+                pos[p_start:p_end][too_far] = centroid + vecs[too_far] * scale
+
+    def step_simulation() -> None:
+        solver.step(DT)
+        clamp_internal_particles()
+        update_visuals()
+
+    def update_visuals() -> None:
+        for mesh, s_start, s_end in ps_meshes:
+            mesh.update_vertex_positions(body.positions[s_start:s_end])
+        for cloud, p_start, p_end in ps_clouds:
+            cloud.update_point_positions(body.positions[p_start:p_end])
 
     def frame() -> None:
-        solver.step(DT)
-        # Update vertex positions for each registered bag
-        for mesh, start, end in ps_meshes:
-            mesh.update_vertex_positions(body.positions[start:end])
+        nonlocal is_running
+        import polyscope.imgui as imgui
+
+        # UI panel for simulation controls
+        imgui.Text("Simulation Controls:")
+        if imgui.Button("Reset / Restart"):
+            reset_simulation()
+        imgui.SameLine()
+        if imgui.Button("Pause" if is_running else "Play"):
+            is_running = not is_running
+        imgui.SameLine()
+        if imgui.Button("Step"):
+            step_simulation()
+
+        if is_running:
+            step_simulation()
 
     ps.set_user_callback(frame)
     ps.show()
+
+
 
 
 if __name__ == "__main__":

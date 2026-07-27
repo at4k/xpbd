@@ -48,3 +48,9 @@ class Solver:
                     for i in range(len(con)):
                         con.project_one(i, body.positions, body.inv_mass, h)
             body.velocities = (body.positions - x_prev) / h
+
+    def reset(self) -> None:
+        """Reset internal constraint states (e.g. Lagrange multipliers)."""
+        for con in self.constraints:
+            con.reset_lambda()
+

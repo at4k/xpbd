@@ -54,48 +54,95 @@ class ParticleCollisionConstraint:
         if n <= 1:
             return
 
-        diff = x[:, None, :] - x[None, :, :]  # (N, N, 3)
-        dist = np.linalg.norm(diff, axis=-1)  # (N, N)
+        # 1D Sweep and Prune Broadphase filtering to avoid N^2 distance computations
+        order = np.argsort(x[:, 0])
+        x_s = x[order]
+        r_s = self.radii[order]
+        idx_s = np.arange(n)[order]
 
-        sum_radii = self.radii[:, None] + self.radii[None, :]  # (N, N)
+        # Find candidate pairs (i < j) whose X-interval overlaps
+        pairs_i = []
+        pairs_j = []
 
-        # Collision mask: dist < sum_radii, and i < j (to handle each pair once)
-        mask = (dist < sum_radii) & (dist > _EPS)
-        tri_mask = np.triu(np.ones((n, n), dtype=bool), k=1)
-        mask &= tri_mask
+        for i in range(n - 1):
+            x_i = x_s[i, 0]
+            r_i = r_s[i]
+            # Search right bound
+            limit = x_i + r_i + np.max(r_s[i + 1:])
+            j_end = np.searchsorted(x_s[:, 0], limit, side="right")
+            if j_end > i + 1:
+                js = np.arange(i + 1, j_end)
+                # Quick Y and Z bounding box check
+                dx = x_s[js, 0] - x_i
+                dy = np.abs(x_s[js, 1] - x_s[i, 1])
+                dz = np.abs(x_s[js, 2] - x_s[i, 2])
+                sum_r = r_i + r_s[js]
 
-        # Exclude direct edge-connected neighbors
-        mask &= ~self.adj
+                valid = (dx < sum_r) & (dy < sum_r) & (dz < sum_r)
+                if np.any(valid):
+                    valid_js = js[valid]
+                    pairs_i.append(np.full(len(valid_js), i, dtype=np.int64))
+                    pairs_j.append(valid_js)
+
+        if not pairs_i:
+            return
+
+        ii_s = np.concatenate(pairs_i)
+        jj_s = np.concatenate(pairs_j)
+
+        # Map sorted indices back to original indices
+        ii = idx_s[ii_s]
+        jj = idx_s[jj_s]
+
+        # Enforce canonical ordering (ii < jj)
+        swap = ii > jj
+        ii[swap], jj[swap] = jj[swap], ii[swap]
+
+        # Neighbor mesh filtering (exclude 1-ring neighbors)
+        mask = ~self.adj[ii, jj]
 
         if not self.self_collision and self.group_ids is not None:
-            # Only collide different groups
-            group_mask = self.group_ids[:, None] != self.group_ids[None, :]
-            mask &= group_mask
+            mask &= (self.group_ids[ii] != self.group_ids[jj])
 
-        ii, jj = np.where(mask)
+        ii = ii[mask]
+        jj = jj[mask]
+
         if len(ii) == 0:
             return
 
-        # Resolve collisions
-        d_val = dist[ii, jj]
-        overlap = sum_radii[ii, jj] - d_val
-        dir_vec = diff[ii, jj] / d_val[:, None]  # from j to i
+        # Precise 3D distance check & resolution
+        diff = x[ii] - x[jj]  # vector from j to i
+        dist_sq = np.sum(diff**2, axis=-1)
+        sum_radii = self.radii[ii] + self.radii[jj]
+
+        colliding = (dist_sq < sum_radii**2) & (dist_sq > _EPS)
+        if not np.any(colliding):
+            return
+
+        ii = ii[colliding]
+        jj = jj[colliding]
+        diff = diff[colliding]
+        d_val = np.sqrt(dist_sq[colliding])
+        sum_r = sum_radii[colliding]
+
+        overlap = sum_r - d_val
+        dir_vec = diff / d_val[:, None]
 
         w_i = inv_mass[ii]
         w_j = inv_mass[jj]
         w_sum = w_i + w_j
 
-        valid = w_sum > _EPS
-        if not np.any(valid):
+        valid_w = w_sum > _EPS
+        if not np.any(valid_w):
             return
 
-        ii = ii[valid]
-        jj = jj[valid]
-        overlap = overlap[valid]
-        dir_vec = dir_vec[valid]
-        w_i = w_i[valid]
-        w_j = w_j[valid]
-        w_sum = w_sum[valid]
+        ii = ii[valid_w]
+        jj = jj[valid_w]
+        overlap = overlap[valid_w]
+        dir_vec = dir_vec[valid_w]
+        w_i = w_i[valid_w]
+        w_j = w_j[valid_w]
+        w_sum = w_sum[valid_w]
 
         # Positional correction
         corr = (overlap / w_sum)[:, None] * dir_vec
@@ -108,12 +155,9 @@ class ParticleCollisionConstraint:
         np.add.at(count, ii, 1.0)
         np.add.at(count, jj, 1.0)
 
-        # Average corrections per particle to maintain stability
         active = count > 0
-        # In highly packed systems, dividing fully by count can over-damp collision response.
-        # Dividing by np.sqrt(count) provides a much stronger and more robust collision
-        # barrier while maintaining perfect stability under XPBD.
         x[active] += delta[active] / np.sqrt(count[active])[:, None]
+
 
     def project_one(
         self, i: int, x: np.ndarray, inv_mass: np.ndarray, h: float

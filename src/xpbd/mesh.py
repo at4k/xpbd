@@ -131,3 +131,109 @@ def tet_grid(
     flipped[:, [0, 1]] = flipped[:, [1, 0]]
     tets[flip] = flipped
     return positions, tets
+
+
+def icosphere_mesh(
+    subdivisions: int = 2,
+    radius: float = 1.0,
+    origin: tuple = (0.0, 0.0, 0.0),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generates a geodesic icosphere surface mesh with uniform vertex valence."""
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    verts = [
+        np.array([-1.0, phi, 0.0]),
+        np.array([1.0, phi, 0.0]),
+        np.array([-1.0, -phi, 0.0]),
+        np.array([1.0, -phi, 0.0]),
+        np.array([0.0, -1.0, phi]),
+        np.array([0.0, 1.0, phi]),
+        np.array([0.0, -1.0, -phi]),
+        np.array([0.0, 1.0, -phi]),
+        np.array([phi, 0.0, -1.0]),
+        np.array([phi, 0.0, 1.0]),
+        np.array([-phi, 0.0, -1.0]),
+        np.array([-phi, 0.0, 1.0]),
+    ]
+    faces = np.array(
+        [
+            [0, 11, 5],
+            [0, 5, 1],
+            [0, 1, 7],
+            [0, 7, 10],
+            [0, 10, 11],
+            [1, 5, 9],
+            [5, 11, 4],
+            [11, 10, 2],
+            [10, 7, 6],
+            [7, 1, 8],
+            [3, 9, 4],
+            [3, 4, 2],
+            [3, 2, 6],
+            [3, 6, 8],
+            [3, 8, 9],
+            [4, 9, 5],
+            [2, 4, 11],
+            [6, 2, 10],
+            [8, 6, 7],
+            [9, 8, 1],
+        ],
+        dtype=np.int64,
+    )
+
+    middle_point_cache: dict[tuple[int, int], int] = {}
+
+    def get_middle_point(p1: int, p2: int) -> int:
+        key = (min(p1, p2), max(p1, p2))
+        if key in middle_point_cache:
+            return middle_point_cache[key]
+        middle = (verts[p1] + verts[p2]) * 0.5
+        verts.append(middle)
+        idx = len(verts) - 1
+        middle_point_cache[key] = idx
+        return idx
+
+    for _ in range(subdivisions):
+        faces_sub = []
+        for tri in faces:
+            a = get_middle_point(tri[0], tri[1])
+            b = get_middle_point(tri[1], tri[2])
+            c = get_middle_point(tri[2], tri[0])
+            faces_sub.extend(
+                [
+                    [tri[0], a, c],
+                    [tri[1], b, a],
+                    [tri[2], c, b],
+                    [a, b, c],
+                ]
+            )
+        faces = np.array(faces_sub, dtype=np.int64)
+
+    verts_arr = np.array(verts, dtype=np.float64)
+    norms = np.linalg.norm(verts_arr, axis=1, keepdims=True)
+    verts_arr = (verts_arr / np.maximum(norms, 1e-12)) * radius + np.asarray(
+        origin, dtype=np.float64
+    )
+    return verts_arr, faces
+
+
+def sphere_tet_mesh(
+    subdivisions: int = 3,
+    radius: float = 1.0,
+    origin: tuple = (0.0, 0.0, 0.0),
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Generates a spherified 3D tetrahedral mesh (positions, boundary_faces, tets)."""
+    pos, tets = tet_grid(
+        subdivisions,
+        subdivisions,
+        subdivisions,
+        spacing=2.0 / subdivisions,
+        origin=(-1.0, -1.0, -1.0),
+    )
+    norms = np.linalg.norm(pos, axis=1, keepdims=True)
+    pos_sphere = (pos / np.maximum(norms, 1e-12)) * radius + np.asarray(
+        origin, dtype=np.float64
+    )
+    boundary_faces = surface_from_tets(tets)
+    return pos_sphere, boundary_faces, tets
+
+
