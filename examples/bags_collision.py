@@ -372,10 +372,10 @@ def main() -> None:
             mouse_pos = (float(m_pos.x), float(m_pos.y))
         else:
             mouse_pos = (float(m_pos[0]), float(m_pos[1]))
-        is_down = io.MouseDown[0]
 
+        # Mouse down check
+        is_down = bool(io.MouseDown[0])
 
-        # Convert screen mouse coordinate to 3D Ray safely
         try:
             ray_o, ray_d = ps.screen_coords_to_world_ray(mouse_pos)
         except Exception:
@@ -390,7 +390,7 @@ def main() -> None:
 
         ray_d = ray_d / norm_d
 
-        if is_down and not io.WantCaptureMouse:
+        if is_down:
             if grabbed_idx is None:
                 # Find nearest surface vertex to ray
                 pos = body.positions
@@ -400,10 +400,11 @@ def main() -> None:
                 dists = np.linalg.norm(pos - closest_pts, axis=1)
 
                 min_idx = np.argmin(dists)
-                if dists[min_idx] < 0.40 and not np.isnan(dists[min_idx]):  # Within grab radius
-                    grabbed_idx = min_idx
-                    grabbed_depth = t[min_idx]
-                    last_target_pos = pos[min_idx].copy()
+                # Generous grab threshold (1.0) so clicking near any bag immediately catches it
+                if dists[min_idx] < 1.0 and not np.isnan(dists[min_idx]):
+                    grabbed_idx = int(min_idx)
+                    grabbed_depth = float(t[min_idx])
+                    last_target_pos = pos[grabbed_idx].copy()
             else:
                 # Drag active grabbed vertex to new target position
                 target_pos = ray_o + ray_d * grabbed_depth
@@ -415,10 +416,10 @@ def main() -> None:
                     body.positions[grabbed_idx] = target_pos
                     last_target_pos = target_pos.copy()
 
-                    # Draw elastic drag line
+                    # Draw thick red drag line
                     nodes = np.array([body.positions[grabbed_idx], target_pos])
                     edges = np.array([[0, 1]])
-                    ps.register_curve_network("drag_line", nodes, edges, radius=0.015, color=(1.0, 0.2, 0.2))
+                    ps.register_curve_network("drag_line", nodes, edges, radius=0.02, color=(1.0, 0.1, 0.1))
         else:
             if grabbed_idx is not None:
                 grabbed_idx = None
@@ -442,8 +443,8 @@ def main() -> None:
 
         io = imgui.GetIO()
 
-        # Toggle camera vs mouse drag mode
-        ps.set_do_default_mouse_interaction(not drag_mode)
+        # Keep default mouse interaction enabled for camera Orbit when not dragging
+        ps.set_do_default_mouse_interaction(grabbed_idx is None)
 
         imgui.Text("Simulation Controls:")
         if imgui.Button("Reset / Restart"):
@@ -459,16 +460,19 @@ def main() -> None:
         drag_mode = res[1] if isinstance(res, tuple) else res
 
         if drag_mode:
-            imgui.TextColored((0.4, 0.9, 0.4, 1.0), "Left-click & drag anywhere on a bag to grab and throw it!")
+            imgui.TextColored((0.2, 1.0, 0.2, 1.0), "Mouse Grab ON: Left-click anywhere near a bag to grab & throw!")
             handle_mouse_interaction(io)
+            if grabbed_idx is not None:
+                imgui.TextColored((1.0, 0.3, 0.3, 1.0), f"GRABBED Vertex #{grabbed_idx} - Drag mouse to move!")
         else:
-            imgui.TextColored((0.7, 0.7, 0.7, 1.0), "Camera Orbit Mode active.")
+            imgui.TextColored((0.7, 0.7, 0.7, 1.0), "Camera Orbit Mode active (drag background to rotate camera).")
 
         if is_running:
             step_simulation()
 
     ps.set_user_callback(frame)
     ps.show()
+
 
 
 
