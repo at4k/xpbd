@@ -441,6 +441,8 @@ def main() -> None:
         is_down = bool(io.MouseDown[0])
 
         if nav_mode == 0:  # Pure Mouse Push Mode (Camera Locked)
+            ps.reset_selection()  # Clear Polyscope Selection window to prevent locking mouse drag coordinates!
+
             if abs(io.MouseWheel) > 0.01:
                 pusher_depth += io.MouseWheel * 0.15
 
@@ -469,6 +471,7 @@ def main() -> None:
                         pusher_pos = ray_o + ray_d * pusher_depth
             except Exception:
                 pass
+
 
         imgui.Text("Simulation Controls:")
         if imgui.Button("Reset / Restart"):
