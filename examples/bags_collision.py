@@ -296,7 +296,9 @@ def main() -> None:
     init_velocities = body.velocities.copy()
 
     is_running = True
-    drag_mode = True
+    tool_mode = 0  # 0: Push Tool, 1: Grab Tool
+    push_radius = 0.30
+    push_depth_offset = 0.0
     grabbed_idx = None
     grabbed_depth = 0.0
     last_target_pos = None
@@ -373,7 +375,6 @@ def main() -> None:
         else:
             mouse_pos = (float(m_pos[0]), float(m_pos[1]))
 
-        # Mouse down check
         is_down = bool(io.MouseDown[0])
 
         try:
@@ -390,41 +391,74 @@ def main() -> None:
 
         ray_d = ray_d / norm_d
 
+        # Calculate 3D tool position along ray
+        pos = body.positions
+        diff = pos - ray_o
+        t_proj = np.maximum(0.0, np.dot(diff, ray_d))
+        closest_pts = ray_o + t_proj[:, None] * ray_d
+        dists = np.linalg.norm(pos - closest_pts, axis=1)
+        min_idx = np.argmin(dists)
+
+        # Default depth at nearest object or fixed distance
+        tool_depth = t_proj[min_idx] if dists[min_idx] < 1.5 else 2.0
+        tool_depth += push_depth_offset
+        tool_center = ray_o + ray_d * tool_depth
+
+        # Register 3D Visual Marker Reaction
+        marker = ps.register_point_cloud("push_tool_marker", np.array([tool_center]))
         if is_down:
-            if grabbed_idx is None:
-                # Find nearest surface vertex to ray
-                pos = body.positions
-                diff = pos - ray_o
-                t = np.maximum(0.0, np.dot(diff, ray_d))
-                closest_pts = ray_o + t[:, None] * ray_d
-                dists = np.linalg.norm(pos - closest_pts, axis=1)
-
-                min_idx = np.argmin(dists)
-                # Generous grab threshold (1.0) so clicking near any bag immediately catches it
-                if dists[min_idx] < 1.0 and not np.isnan(dists[min_idx]):
-                    grabbed_idx = int(min_idx)
-                    grabbed_depth = float(t[min_idx])
-                    last_target_pos = pos[grabbed_idx].copy()
-            else:
-                # Drag active grabbed vertex to new target position
-                target_pos = ray_o + ray_d * grabbed_depth
-                if not np.any(np.isnan(target_pos)):
-                    if last_target_pos is not None:
-                        vel = (target_pos - last_target_pos) / DT
-                        if not np.any(np.isnan(vel)):
-                            body.velocities[grabbed_idx] = vel
-                    body.positions[grabbed_idx] = target_pos
-                    last_target_pos = target_pos.copy()
-
-                    # Draw thick red drag line
-                    nodes = np.array([body.positions[grabbed_idx], target_pos])
-                    edges = np.array([[0, 1]])
-                    ps.register_curve_network("drag_line", nodes, edges, radius=0.02, color=(1.0, 0.1, 0.1))
+            marker.set_color((1.0, 0.4, 0.1))  # Glowing bright orange when active/pushing
+            marker.set_radius(push_radius * 0.4)
         else:
-            if grabbed_idx is not None:
-                grabbed_idx = None
-                last_target_pos = None
-                ps.remove_curve_network("drag_line", error_if_absent=False)
+            marker.set_color((0.2, 0.9, 1.0))  # Bright cyan preview when hovering
+            marker.set_radius(0.03)
+
+        if tool_mode == 0:  # PUSHER TOOL MODE (Push/Repulse from any direction)
+            if is_down:
+                # Repulse all surface vertices within push_radius
+                vecs = pos - tool_center
+                dists_to_tool = np.linalg.norm(vecs, axis=1)
+                inside = dists_to_tool < push_radius
+
+                if np.any(inside):
+                    for idx in np.where(inside)[0]:
+                        d = dists_to_tool[idx]
+                        if d < 1e-6:
+                            dir_vec = np.array([0.0, 1.0, 0.0])  # Push upward if exactly centered
+                        else:
+                            dir_vec = vecs[idx] / d
+
+                        target_p = tool_center + dir_vec * push_radius
+                        # Give pushing velocity for fluid movement
+                        vel = (target_p - pos[idx]) / DT
+                        body.velocities[idx] = vel
+                        pos[idx] = target_p
+
+        elif tool_mode == 1:  # GRABBER TOOL MODE (Grab & Pull)
+            if is_down:
+                if grabbed_idx is None:
+                    if dists[min_idx] < 1.0 and not np.isnan(dists[min_idx]):
+                        grabbed_idx = int(min_idx)
+                        grabbed_depth = float(t_proj[min_idx])
+                        last_target_pos = pos[grabbed_idx].copy()
+                else:
+                    target_pos = ray_o + ray_d * grabbed_depth
+                    if not np.any(np.isnan(target_pos)):
+                        if last_target_pos is not None:
+                            vel = (target_pos - last_target_pos) / DT
+                            if not np.any(np.isnan(vel)):
+                                body.velocities[grabbed_idx] = vel
+                        pos[grabbed_idx] = target_pos
+                        last_target_pos = target_pos.copy()
+
+                        nodes = np.array([body.positions[grabbed_idx], target_pos])
+                        edges = np.array([[0, 1]])
+                        ps.register_curve_network("drag_line", nodes, edges, radius=0.02, color=(1.0, 0.1, 0.1))
+            else:
+                if grabbed_idx is not None:
+                    grabbed_idx = None
+                    last_target_pos = None
+                    ps.remove_curve_network("drag_line", error_if_absent=False)
 
     def step_simulation() -> None:
         solver.step(DT)
@@ -438,13 +472,13 @@ def main() -> None:
             cloud.update_point_positions(body.positions[p_start:p_end])
 
     def frame() -> None:
-        nonlocal is_running, drag_mode
+        nonlocal is_running, tool_mode, push_radius, push_depth_offset
         import polyscope.imgui as imgui
 
         io = imgui.GetIO()
 
-        # Keep default mouse interaction enabled for camera Orbit when not dragging
-        ps.set_do_default_mouse_interaction(grabbed_idx is None)
+        # Orbit camera when not actively pushing/grabbing
+        ps.set_do_default_mouse_interaction(not io.MouseDown[0])
 
         imgui.Text("Simulation Controls:")
         if imgui.Button("Reset / Restart"):
@@ -456,22 +490,27 @@ def main() -> None:
         if imgui.Button("Step"):
             step_simulation()
 
-        res = imgui.Checkbox("Mouse Drag Mode (Grab & Throw Bags)", drag_mode)
-        drag_mode = res[1] if isinstance(res, tuple) else res
+        imgui.Separator()
+        imgui.Text("3D Interactive Tools:")
+        changed_mode, tool_mode = imgui.RadioButton("3D Pusher (Push from top/bottom/sides)", tool_mode, 0)
+        imgui.SameLine()
+        _, tool_mode = imgui.RadioButton("Grabber (Pull)", tool_mode, 1)
 
-        if drag_mode:
-            imgui.TextColored((0.2, 1.0, 0.2, 1.0), "Mouse Grab ON: Left-click anywhere near a bag to grab & throw!")
-            handle_mouse_interaction(io)
-            if grabbed_idx is not None:
-                imgui.TextColored((1.0, 0.3, 0.3, 1.0), f"GRABBED Vertex #{grabbed_idx} - Drag mouse to move!")
+        if tool_mode == 0:
+            imgui.TextColored((0.2, 1.0, 0.4, 1.0), "[3D Pusher Active] Left-click to push bags from ANY direction!")
+            _, push_radius = imgui.SliderFloat("Pusher Radius", push_radius, 0.1, 0.8)
+            _, push_depth_offset = imgui.SliderFloat("Pusher Height/Depth Offset", push_depth_offset, -0.5, 0.5)
         else:
-            imgui.TextColored((0.7, 0.7, 0.7, 1.0), "Camera Orbit Mode active (drag background to rotate camera).")
+            imgui.TextColored((1.0, 0.6, 0.2, 1.0), "[3D Grabber Active] Left-click & drag to pull bags!")
+
+        handle_mouse_interaction(io)
 
         if is_running:
             step_simulation()
 
     ps.set_user_callback(frame)
     ps.show()
+
 
 
 
