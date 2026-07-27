@@ -433,16 +433,30 @@ def main() -> None:
         for cloud, p_start, p_end in ps_clouds:
             cloud.update_point_positions(body.positions[p_start:p_end])
 
+    prev_space_state = False
+
     def frame() -> None:
-        nonlocal is_running, push_radius, pusher_pos, pusher_depth, direct_mouse_push
+        nonlocal is_running, push_radius, pusher_pos, pusher_depth, direct_mouse_push, prev_space_state
         import polyscope.imgui as imgui
 
         io = imgui.GetIO()
 
-        # Check Right-Click (MouseDown[1]) or Shift+Left-Click for object pushing
-        is_right_down = bool(io.MouseDown[1]) if len(io.MouseDown) > 1 else False
-        is_shift_left = bool(io.MouseDown[0]) and io.KeyShift
-        is_active_push = is_right_down or is_shift_left
+        # Check Space key (ASCII 32) status for camera lock
+        is_space_pressed = False
+        try:
+            if hasattr(io, "KeysDown") and len(io.KeysDown) > 32:
+                is_space_pressed = bool(io.KeysDown[32])
+        except Exception:
+            pass
+
+        # Switch camera interaction state ONLY when Space key status changes
+        if is_space_pressed != prev_space_state:
+            ps.set_do_default_mouse_interaction(not is_space_pressed)
+            prev_space_state = is_space_pressed
+
+        is_down = bool(io.MouseDown[0])
+        # Direct mouse physics interaction is active when Space is held or left-click is active in Space mode
+        is_active_push = is_space_pressed and is_down
 
         if direct_mouse_push:
             if abs(io.MouseWheel) > 0.01:
@@ -496,10 +510,11 @@ def main() -> None:
             apply_poke_force()
 
         imgui.Separator()
-        imgui.TextColored((1.0, 0.9, 0.2, 1.0), "Mouse Controls Guide:")
-        imgui.TextColored((0.7, 0.7, 0.7, 1.0), "Camera Orbit (Rotate Scene): Left-Click & Drag")
-        imgui.TextColored((0.2, 1.0, 0.4, 1.0), "Push/Interact Bags:          RIGHT-CLICK & Drag (or Shift+Left-Click)")
-        imgui.TextColored((0.9, 0.6, 0.2, 1.0), "Adjust Height/Depth:         Mouse Wheel")
+        imgui.TextColored((1.0, 0.9, 0.2, 1.0), "Mouse Interaction Mode:")
+        if is_space_pressed:
+            imgui.TextColored((0.2, 1.0, 0.4, 1.0), ">>> [PHYSICS PUSH ACTIVE] Camera Locked. Drag Mouse to Push Bags! <<<")
+        else:
+            imgui.TextColored((0.7, 0.7, 0.7, 1.0), "[Camera Orbit Mode] Hold SPACE KEY & Drag Mouse to Push Bags!")
 
         imgui.Separator()
         res_push = imgui.Checkbox("Direct Mouse Pusher Active", direct_mouse_push)
@@ -517,6 +532,7 @@ def main() -> None:
 
     ps.set_user_callback(frame)
     ps.show()
+
 
 
 
