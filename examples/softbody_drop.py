@@ -34,6 +34,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode", choices=["jacobi", "gauss_seidel"], default="jacobi"
     )
+    parser.add_argument(
+        "--transparency", type=float, default=0.4,
+        help="Mesh surface transparency (0.0=invisible, 1.0=opaque, default=0.4)"
+    )
+    parser.add_argument(
+        "--point-radius", type=float, default=0.015,
+        help="Radius of internal node particles"
+    )
     return parser.parse_args()
 
 
@@ -87,15 +95,68 @@ def main() -> None:
     solver = build_solver(args)
     body = solver.body
 
+    init_positions = body.positions.copy()
+    is_running = True
+    transparency = args.transparency
+    point_radius = args.point_radius
+    show_mesh = True
+    show_nodes = True
+
     ps.init()
     ps.set_ground_plane_mode("none")
     ps.set_up_dir("y_up")
     register_floor()
+
     mesh = ps.register_volume_mesh("softbody", body.positions, tets=body.tets)
+    mesh.set_transparency(transparency)
+
+    nodes = ps.register_point_cloud("nodes", body.positions)
+    nodes.set_radius(point_radius)
+    nodes.set_color((0.2, 0.5, 0.9))
+
+    def reset_simulation() -> None:
+        body.positions[:] = init_positions.copy()
+        body.velocities[:] = np.zeros_like(init_positions)
+        solver.reset()
+        mesh.update_vertex_positions(body.positions)
+        nodes.update_point_positions(body.positions)
 
     def frame() -> None:
-        solver.step(DT)
-        mesh.update_vertex_positions(body.positions)
+        nonlocal is_running, transparency, point_radius, show_mesh, show_nodes
+        import polyscope.imgui as imgui
+
+        if imgui.Button("Reset"):
+            reset_simulation()
+        imgui.SameLine()
+        if imgui.Button("Pause" if is_running else "Play"):
+            is_running = not is_running
+
+        imgui.SeparatorText("Visualization")
+
+        changed_trans, new_trans = imgui.SliderFloat("Surface Transparency", transparency, 0.0, 1.0)
+        if changed_trans:
+            transparency = new_trans
+            mesh.set_transparency(transparency)
+
+        changed_rad, new_rad = imgui.SliderFloat("Point Radius", point_radius, 0.001, 0.05)
+        if changed_rad:
+            point_radius = new_rad
+            nodes.set_radius(point_radius)
+
+        changed_m, new_m = imgui.Checkbox("Show Mesh", show_mesh)
+        if changed_m:
+            show_mesh = new_m
+            mesh.set_enabled(show_mesh)
+
+        changed_n, new_n = imgui.Checkbox("Show Nodes", show_nodes)
+        if changed_n:
+            show_nodes = new_n
+            nodes.set_enabled(show_nodes)
+
+        if is_running:
+            solver.step(DT)
+            mesh.update_vertex_positions(body.positions)
+            nodes.update_point_positions(body.positions)
 
     ps.set_user_callback(frame)
     ps.show()

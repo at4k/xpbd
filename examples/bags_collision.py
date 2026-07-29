@@ -41,6 +41,14 @@ def parse_args() -> argparse.Namespace:
         "--mode", choices=["jacobi", "gauss_seidel"], default="jacobi",
         help="jacobi mode is vectorized and dramatically faster"
     )
+    parser.add_argument(
+        "--transparency", type=float, default=0.4,
+        help="Surface mesh transparency (0.0=invisible, 1.0=opaque, default=0.4 for inner point visibility)"
+    )
+    parser.add_argument(
+        "--point-radius", type=float, default=0.015,
+        help="Radius of rendered point cloud particles"
+    )
     return parser.parse_args()
 
 
@@ -292,11 +300,18 @@ def main() -> None:
     body = solver.body
 
     # Backup initial positions & velocities for instant reset
+    init_positions = body.positions.copy()
+    init_velocities = body.velocities.copy()
     is_running = True
     push_radius = 0.35
     grabbed_idx = None
     grabbed_depth = 2.0
     interaction_active = False  # toggled only on Ctrl press/release edges, not every frame
+
+    transparency = args.transparency
+    point_radius = args.point_radius
+    show_surface = True
+    show_points = True
 
     def reset_simulation() -> None:
         nonlocal is_running, grabbed_idx
@@ -335,13 +350,14 @@ def main() -> None:
         mesh.set_color(color)
         mesh.set_edge_width(1.0)
         mesh.set_smooth_shade(True)
+        mesh.set_transparency(transparency)
         ps_meshes.append((mesh, s_start, s_end))
 
         if p_end > p_start:
             cloud_name = f"particles_{bag_idx}"
             cloud = ps.register_point_cloud(cloud_name, body.positions[p_start:p_end])
             cloud.set_color(color)
-            cloud.set_radius(0.010)
+            cloud.set_radius(point_radius)
             ps_clouds.append((cloud, p_start, p_end))
 
     def clamp_internal_particles() -> None:
@@ -444,7 +460,7 @@ def main() -> None:
             cloud.update_point_positions(body.positions[p_start:p_end])
 
     def frame() -> None:
-        nonlocal is_running, interaction_active
+        nonlocal is_running, interaction_active, transparency, point_radius, show_surface, show_points
         import polyscope.imgui as imgui
 
         io = imgui.GetIO()
@@ -469,6 +485,32 @@ def main() -> None:
         imgui.SameLine()
         if imgui.Button("Pause" if is_running else "Play"):
             is_running = not is_running
+
+        imgui.SeparatorText("Visualization")
+
+        changed_trans, new_trans = imgui.SliderFloat("Surface Transparency", transparency, 0.0, 1.0)
+        if changed_trans:
+            transparency = new_trans
+            for mesh, _, _ in ps_meshes:
+                mesh.set_transparency(transparency)
+
+        changed_rad, new_rad = imgui.SliderFloat("Point Radius", point_radius, 0.001, 0.05)
+        if changed_rad:
+            point_radius = new_rad
+            for cloud, _, _ in ps_clouds:
+                cloud.set_radius(point_radius)
+
+        changed_surf, new_surf = imgui.Checkbox("Show Surface Mesh", show_surface)
+        if changed_surf:
+            show_surface = new_surf
+            for mesh, _, _ in ps_meshes:
+                mesh.set_enabled(show_surface)
+
+        changed_pts, new_pts = imgui.Checkbox("Show Internal Points", show_points)
+        if changed_pts:
+            show_points = new_pts
+            for cloud, _, _ in ps_clouds:
+                cloud.set_enabled(show_points)
 
         if is_running:
             step_simulation()
