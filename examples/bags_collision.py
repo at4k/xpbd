@@ -296,6 +296,7 @@ def main() -> None:
     push_radius = 0.35
     grabbed_idx = None
     grabbed_depth = 2.0
+    interaction_active = False  # toggled only on Ctrl press/release edges, not every frame
 
     def reset_simulation() -> None:
         nonlocal is_running, grabbed_idx
@@ -362,17 +363,23 @@ def main() -> None:
                 scale = (r_max_allowed / np.maximum(dists[too_far], 1e-12))[:, None]
                 pos[p_start:p_end][too_far] = centroid + vecs[too_far] * scale
 
-    def handle_direct_mouse_drag(io) -> None:
+    def handle_direct_mouse_drag(io, interaction_active: bool) -> None:
         nonlocal grabbed_idx, grabbed_depth
 
-        is_down = bool(io.MouseDown[0]) or bool(io.MouseDown[1])
+        is_down = interaction_active and (bool(io.MouseDown[0]) or bool(io.MouseDown[1]))
+
+        if not interaction_active and grabbed_idx is None:
+            return
 
         try:
             m_pos = io.MousePos
             px = float(m_pos.x) if hasattr(m_pos, "x") else float(m_pos[0])
             py = float(m_pos.y) if hasattr(m_pos, "y") else float(m_pos[1])
 
-            ray_o, ray_d = ps.screen_coords_to_world_ray((px, py))
+            # screen_coords_to_world_ray returns only the ray DIRECTION (3-vector);
+            # the origin is the camera eye position, constant for every pixel this frame.
+            ray_d = ps.screen_coords_to_world_ray((px, py))
+            ray_o = ps.get_view_camera_parameters().get_position()
             if ray_o is None or ray_d is None or np.any(np.isnan(ray_o)) or np.any(np.isnan(ray_d)):
                 return
 
@@ -422,8 +429,8 @@ def main() -> None:
                 if grabbed_idx is not None:
                     grabbed_idx = None
                     ps.remove_point_cloud("mouse_grab_marker", error_if_absent=False)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[mouse drag] error: {e!r}")
 
     def step_simulation() -> None:
         solver.step(DT)
@@ -437,13 +444,25 @@ def main() -> None:
             cloud.update_point_positions(body.positions[p_start:p_end])
 
     def frame() -> None:
-        nonlocal is_running
+        nonlocal is_running, interaction_active
         import polyscope.imgui as imgui
 
         io = imgui.GetIO()
 
-        # Handle direct mouse interaction every frame
-        handle_direct_mouse_drag(io)
+        # Ctrl (or Cmd on macOS, where the physical Ctrl key doesn't reach this app) held
+        # = physics grab mode, with camera navigation suspended.
+        # Toggled only on the press/release edge so a drag never straddles both modes.
+        modifier_down = bool(
+            imgui.IsKeyDown(imgui.ImGuiKey_LeftCtrl)
+            or imgui.IsKeyDown(imgui.ImGuiKey_RightCtrl)
+            or imgui.IsKeyDown(imgui.ImGuiKey_LeftSuper)
+            or imgui.IsKeyDown(imgui.ImGuiKey_RightSuper)
+        )
+        if modifier_down != interaction_active:
+            interaction_active = modifier_down
+            ps.set_do_default_mouse_interaction(not interaction_active)
+
+        handle_direct_mouse_drag(io, interaction_active)
 
         if imgui.Button("Reset / Restart"):
             reset_simulation()
