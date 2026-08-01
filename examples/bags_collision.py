@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
         help="icosphere (uniform surface), tet_sphere (3D tetrahedral mesh), cube_sphere (legacy)"
     )
     parser.add_argument(
-        "--internal-particles", type=int, default=15,
+        "--internal-particles", type=int, default=120,
         help="Number of internal fluid particles per bag (0 to disable)"
     )
     parser.add_argument(
@@ -62,8 +62,8 @@ def generate_internal_particles(
     if num_particles <= 0:
         return np.zeros((0, 3), dtype=np.float64)
 
-    # Fill within 45% radius of sphere to maintain clear safety gap from shell
-    r_max = radius * 0.45
+    # Fill up to 82% radius of sphere to properly pack and fill the bag interior
+    r_max = radius * 0.82
 
     side = int(np.ceil(num_particles ** (1.0 / 3.0)))
     if side < 2:
@@ -369,7 +369,7 @@ def main() -> None:
             surf_pos = pos[s_start:s_end]
             centroid = np.mean(surf_pos, axis=0)
             r_avg = np.mean(np.linalg.norm(surf_pos - centroid, axis=1))
-            r_max_allowed = r_avg * 0.85
+            r_max_allowed = r_avg * 0.90
 
             part_pos = pos[p_start:p_end]
             vecs = part_pos - centroid

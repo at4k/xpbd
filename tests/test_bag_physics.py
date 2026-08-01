@@ -99,3 +99,26 @@ def test_soft_body_from_surface_mesh():
     assert len(body.edges) > 0
     assert len(body.tets) == 0
     assert np.all(body.inv_mass > 0.0)
+
+
+def test_generate_internal_particles_filling():
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    from examples.bags_collision import generate_internal_particles
+
+    origin = (0.0, 0.0, 0.0)
+    radius = 0.45
+    num_particles = 120
+
+    pts = generate_internal_particles(origin, radius, num_particles)
+    assert len(pts) == num_particles
+
+    # Check particles fill out towards ~82% of bag radius
+    dists = np.linalg.norm(pts - np.array(origin), axis=1)
+    assert np.max(dists) <= radius * 0.82 + 1e-5
+    assert np.max(dists) > radius * 0.50  # Should reach outer regions beyond 50%
+
