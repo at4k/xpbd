@@ -170,3 +170,85 @@ def slice_and_cap_mesh(
     mesh_r = clean_mesh(right_verts, right_faces)
 
     return mesh_l, mesh_r
+
+
+def tangential_surface_relaxation(
+    positions: np.ndarray,
+    faces: np.ndarray,
+    center: np.ndarray | None = None,
+    factor: float = 0.15,
+    n_iters: int = 1,
+) -> np.ndarray:
+    """Equilibrates surface vertices along surface tangents to reduce vertex bunching.
+
+    Preserves the radial profile and volume by constraining movement strictly to
+    tangents and restoring radius from center.
+    """
+    pos = np.asarray(positions, dtype=np.float64).copy()
+    faces = np.asarray(faces, dtype=np.int64)
+    n_verts = len(pos)
+
+    if center is None:
+        center = np.mean(pos, axis=0)
+    else:
+        center = np.asarray(center, dtype=np.float64)
+
+    r_orig = np.linalg.norm(pos - center, axis=1, keepdims=True)
+    r_orig = np.maximum(r_orig, 1e-12)
+
+    # Edge pairs for 1-ring neighbor averaging
+    edges_0 = faces[:, 0]
+    edges_1 = faces[:, 1]
+    edges_2 = faces[:, 2]
+
+    # Symmetric directed pairs: (0, 1), (1, 0), (1, 2), (2, 1), (2, 0), (0, 2)
+    src = np.concatenate([edges_0, edges_1, edges_1, edges_2, edges_2, edges_0])
+    dst = np.concatenate([edges_1, edges_0, edges_2, edges_1, edges_0, edges_2])
+
+    # Remove duplicate directed edges if any
+    unique_pairs = np.unique(np.stack([src, dst], axis=-1), axis=0)
+    src_u, dst_u = unique_pairs[:, 0], unique_pairs[:, 1]
+
+    counts = np.zeros((n_verts, 1), dtype=np.float64)
+    np.add.at(counts, src_u, 1.0)
+    counts = np.maximum(counts, 1.0)
+
+    for _ in range(n_iters):
+        # 1. Compute vertex normals
+        p0, p1, p2 = pos[faces[:, 0]], pos[faces[:, 1]], pos[faces[:, 2]]
+        f_normals = np.cross(p1 - p0, p2 - p0)
+
+        v_normals = np.zeros_like(pos)
+        np.add.at(v_normals, faces[:, 0], f_normals)
+        np.add.at(v_normals, faces[:, 1], f_normals)
+        np.add.at(v_normals, faces[:, 2], f_normals)
+
+        v_norm = np.linalg.norm(v_normals, axis=1, keepdims=True)
+        normals = np.divide(
+            v_normals, v_norm, out=np.zeros_like(v_normals), where=v_norm > 1e-12
+        )
+
+        # 2. Compute 1-ring neighbor averages
+        sums = np.zeros_like(pos)
+        np.add.at(sums, src_u, pos[dst_u])
+        avg_neighbors = sums / counts
+
+        # 3. Laplacian vector
+        laplacian = avg_neighbors - pos
+
+        # 4. Tangential projection (remove component along surface normal)
+        normal_comp = (
+            np.sum(laplacian * normals, axis=1, keepdims=True) * normals
+        )
+        tangent_disp = laplacian - normal_comp
+
+        # 5. Tangential update
+        pos += factor * tangent_disp
+
+        # 6. Restore radial distance from center
+        vec = pos - center
+        cur_r = np.linalg.norm(vec, axis=1, keepdims=True)
+        pos = center + (vec / np.maximum(cur_r, 1e-12)) * r_orig
+
+    return pos
+
