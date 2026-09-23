@@ -7,6 +7,7 @@ from .volume import VolumeConstraint
 from .global_volume import GlobalVolumeConstraint
 from .collision import ParticleCollisionConstraint
 from .box import BoxConstraint
+from .spindle import SpindleConstraint
 
 __all__ = [
     "Constraint",
@@ -16,4 +17,6 @@ __all__ = [
     "GlobalVolumeConstraint",
     "ParticleCollisionConstraint",
     "BoxConstraint",
+    "SpindleConstraint",
 ]
+
