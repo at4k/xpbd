@@ -137,22 +137,26 @@ def slice_and_cap_mesh(
 
     # Cap left mesh (normal should point +X)
     for seg_start, seg_end in left_cap_segments:
-        tri = [l_center_idx, seg_start, seg_end]
         p_c = left_verts[l_center_idx]
         p_s = left_verts[seg_start]
         p_e = left_verts[seg_end]
         normal = np.cross(p_s - p_c, p_e - p_c)
+        if abs(normal[0]) < 1e-12:
+            continue
+        tri = [l_center_idx, seg_start, seg_end]
         if normal[0] < 0:
             tri = [l_center_idx, seg_end, seg_start]
         left_faces.append(tri)
 
     # Cap right mesh (normal should point -X)
     for seg_start, seg_end in right_cap_segments:
-        tri = [r_center_idx, seg_start, seg_end]
         p_c = right_verts[r_center_idx]
         p_s = right_verts[seg_start]
         p_e = right_verts[seg_end]
         normal = np.cross(p_s - p_c, p_e - p_c)
+        if abs(normal[0]) < 1e-12:
+            continue
+        tri = [r_center_idx, seg_start, seg_end]
         if normal[0] > 0:
             tri = [r_center_idx, seg_end, seg_start]
         right_faces.append(tri)
@@ -213,6 +217,14 @@ def tangential_surface_relaxation(
     np.add.at(counts, src_u, 1.0)
     counts = np.maximum(counts, 1.0)
 
+    def _calc_volume(p: np.ndarray, f: np.ndarray) -> float:
+        p1 = p[f[:, 0]]
+        p2 = p[f[:, 1]]
+        p3 = p[f[:, 2]]
+        return float(np.sum(np.einsum("ij,ij->i", np.cross(p1, p2), p3)) / 6.0)
+
+    target_vol = _calc_volume(pos, faces)
+
     for _ in range(n_iters):
         # 1. Compute vertex normals
         p0, p1, p2 = pos[faces[:, 0]], pos[faces[:, 1]], pos[faces[:, 2]]
@@ -249,6 +261,13 @@ def tangential_surface_relaxation(
         vec = pos - center
         cur_r = np.linalg.norm(vec, axis=1, keepdims=True)
         pos = center + (vec / np.maximum(cur_r, 1e-12)) * r_orig
+
+        # 7. Preserve volume strictly by scaling positions
+        if target_vol > 1e-12:
+            cur_vol = _calc_volume(pos, faces)
+            if cur_vol > 1e-12:
+                vol_scale = (target_vol / cur_vol) ** (1.0 / 3.0)
+                pos = center + (pos - center) * vol_scale
 
     return pos
 

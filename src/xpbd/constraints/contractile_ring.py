@@ -72,10 +72,22 @@ class ContractileRingConstraint:
         gz = dz / r
         c = r - self.target_radius
 
+        # Unilateral constraint: only pull inward if radius exceeds target
+        active = c > 0
+        if not np.any(active):
+            return
+
+        idx_m = idx_m[active]
+        w_m = w_m[active]
+        lam_m = lam_m[active]
+        c = c[active]
+        gy = gy[active]
+        gz = gz[active]
+
         alpha = self.compliance / (h**2)
         denom = w_m + alpha
         dlam = -(c + alpha * lam_m) / np.maximum(denom, _EPS)
-        self.lam[np.where(movable)[0][valid_r]] += dlam
+        self.lam[np.where(movable)[0][valid_r][active]] += dlam
 
         corr = dlam * self.relaxation
         x[idx_m, 1] += w_m * corr * gy
@@ -98,6 +110,8 @@ class ContractileRingConstraint:
         gy = dy / r
         gz = dz / r
         c = r - self.target_radius
+        if c <= 0:
+            return
 
         alpha = self.compliance / (h**2)
         denom = w + alpha
