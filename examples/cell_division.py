@@ -123,8 +123,9 @@ class CellDivisionSim:
             self.u_internal = np.zeros((0, 3), dtype=np.float64)
 
         # Spindle parameters (two centrosomes separating inside the cell)
-        self.d_max = self.r_daughter * 0.90  # ~0.36
-        self.d_init = self.r_daughter * 0.20  # ~0.08
+        # Closer daughter distance so lobes remain in close contact across cleavage furrow
+        self.d_max = self.r_daughter * 0.55  # ~0.22 (lobes in close contact)
+        self.d_init = self.r_daughter * 0.15  # ~0.06
         self.spindle_dist = self.d_init
 
         self.pole_0 = np.array(
@@ -177,6 +178,8 @@ class CellDivisionSim:
         self.solver_right: Solver | None = None
         self.dist_con_l: DistanceConstraint | None = None
         self.dist_con_r: DistanceConstraint | None = None
+        self.vol_con_l: GlobalVolumeConstraint | None = None
+        self.vol_con_r: GlobalVolumeConstraint | None = None
         self.n_surf_l = 0
         self.n_surf_r = 0
         self.n_int_l = 0
@@ -200,7 +203,7 @@ class CellDivisionSim:
         r_yz = r_yz_base * r_eff
 
         # Furrow constriction near x = 0
-        waist_width = r_eff * 0.75
+        waist_width = r_eff * 0.65
         w = np.clip(np.abs(x) / waist_width, 0.0, 1.0)
         smooth_w = w * w * (3.0 - 2.0 * w)
         neck_ratio = 1.0 - constrict_t * (1.0 - 0.06)
@@ -228,7 +231,7 @@ class CellDivisionSim:
             xi[near_eq] += (
                 np.where(sign_xi[near_eq] >= 0, 1.0, -1.0)
                 * constrict_t
-                * 0.08
+                * 0.05
             )
 
             # Neck constriction for internal particles
@@ -340,10 +343,10 @@ class CellDivisionSim:
         )
 
         # Rest volume initialized from the newly capped daughter meshes to eliminate velocity spikes
-        vol_con_l = GlobalVolumeConstraint.from_positions(
+        self.vol_con_l = GlobalVolumeConstraint.from_positions(
             self.body_left.positions, [self.faces_left], compliance=0.0
         )
-        vol_con_r = GlobalVolumeConstraint.from_positions(
+        self.vol_con_r = GlobalVolumeConstraint.from_positions(
             self.body_right.positions, [self.faces_right], compliance=0.0
         )
 
@@ -352,14 +355,14 @@ class CellDivisionSim:
 
         self.solver_left = Solver(
             self.body_left,
-            [self.dist_con_l, vol_con_l, box_l],
+            [self.dist_con_l, self.vol_con_l, box_l],
             n_substeps=self.args.substeps,
             mode=self.args.mode,
             gravity=(0.0, 0.0, 0.0),
         )
         self.solver_right = Solver(
             self.body_right,
-            [self.dist_con_r, vol_con_r, box_r],
+            [self.dist_con_r, self.vol_con_r, box_r],
             n_substeps=self.args.substeps,
             mode=self.args.mode,
             gravity=(0.0, 0.0, 0.0),
@@ -417,12 +420,29 @@ class CellDivisionSim:
                 return
 
         else:
-            # Phase 4: Post-division Relaxation & Separation
+            # Phase 4: Post-division Rounding, Relaxation & Separation
             if self.state == CellDivisionState.RELAXING:
                 self.relax_step_count += 1
 
-                # Tangential surface relaxation on both daughter meshes
                 c_l = np.mean(self.body_left.positions[: self.n_surf_l], axis=0)
+                c_r = np.mean(self.body_right.positions[: self.n_surf_r], axis=0)
+
+                # Active spherical rounding: daughter cells round out from cut plane towards full spheres
+                v_l = self.body_left.positions[: self.n_surf_l] - c_l
+                r_l = np.linalg.norm(v_l, axis=1)
+                target_r_l = r_l + (self.r_daughter - r_l) * 0.08
+                self.body_left.positions[: self.n_surf_l] = c_l + (
+                    v_l / np.maximum(r_l[:, None], 1e-12)
+                ) * target_r_l[:, None]
+
+                v_r = self.body_right.positions[: self.n_surf_r] - c_r
+                r_r = np.linalg.norm(v_r, axis=1)
+                target_r_r = r_r + (self.r_daughter - r_r) * 0.08
+                self.body_right.positions[: self.n_surf_r] = c_r + (
+                    v_r / np.maximum(r_r[:, None], 1e-12)
+                ) * target_r_r[:, None]
+
+                # Tangential surface relaxation to optimize point distribution on the rounding membrane
                 rel_l = tangential_surface_relaxation(
                     self.body_left.positions[: self.n_surf_l],
                     self.faces_left,
@@ -432,9 +452,6 @@ class CellDivisionSim:
                 )
                 self.body_left.positions[: self.n_surf_l] = rel_l
 
-                c_r = np.mean(
-                    self.body_right.positions[: self.n_surf_r], axis=0
-                )
                 rel_r = tangential_surface_relaxation(
                     self.body_right.positions[: self.n_surf_r],
                     self.faces_right,
@@ -443,6 +460,40 @@ class CellDivisionSim:
                     n_iters=1,
                 )
                 self.body_right.positions[: self.n_surf_r] = rel_r
+
+                # Adapt edge rest lengths smoothly to the rounding configuration
+                d_l = (
+                    self.body_left.positions[self.body_left.edges[:, 1]]
+                    - self.body_left.positions[self.body_left.edges[:, 0]]
+                )
+                self.dist_con_l.rest_lengths = (
+                    self.dist_con_l.rest_lengths * 0.85
+                    + np.linalg.norm(d_l, axis=1) * 0.15
+                )
+
+                d_r = (
+                    self.body_right.positions[self.body_right.edges[:, 1]]
+                    - self.body_right.positions[self.body_right.edges[:, 0]]
+                )
+                self.dist_con_r.rest_lengths = (
+                    self.dist_con_r.rest_lengths * 0.85
+                    + np.linalg.norm(d_r, axis=1) * 0.15
+                )
+
+                # Update volume constraint rest volumes to match the expanding round sphere
+                p1_l = self.body_left.positions[self.faces_left[:, 0]]
+                p2_l = self.body_left.positions[self.faces_left[:, 1]]
+                p3_l = self.body_left.positions[self.faces_left[:, 2]]
+                self.vol_con_l.rest_volumes[0] = (
+                    np.sum(np.einsum("ij,ij->i", np.cross(p1_l, p2_l), p3_l)) / 6.0
+                )
+
+                p1_r = self.body_right.positions[self.faces_right[:, 0]]
+                p2_r = self.body_right.positions[self.faces_right[:, 1]]
+                p3_r = self.body_right.positions[self.faces_right[:, 2]]
+                self.vol_con_r.rest_volumes[0] = (
+                    np.sum(np.einsum("ij,ij->i", np.cross(p1_r, p2_r), p3_r)) / 6.0
+                )
 
                 # Damp velocities during relaxation
                 self.body_left.velocities *= 0.5
@@ -460,8 +511,8 @@ class CellDivisionSim:
                         int_r, c_r, self.r_daughter * 0.82
                     )
 
-                if self.relax_step_count >= 40:
-                    # Update edge rest lengths to the relaxed configuration
+                if self.relax_step_count >= 50:
+                    # Finalize edge rest lengths to relaxed shape
                     d_l = (
                         self.body_left.positions[self.body_left.edges[:, 1]]
                         - self.body_left.positions[self.body_left.edges[:, 0]]
@@ -479,17 +530,17 @@ class CellDivisionSim:
             self.solver_left.step(DT)
             self.solver_right.step(DT)
 
-            # Smooth mutual collision separation between daughter cells
+            # Smooth mutual collision separation between daughter cells as they round up
             c_l = np.mean(self.body_left.positions[: self.n_surf_l], axis=0)
             c_r = np.mean(self.body_right.positions[: self.n_surf_r], axis=0)
             diff = c_r - c_l
             dist = float(np.linalg.norm(diff))
-            min_dist = self.r_daughter * 1.95
+            min_dist = self.r_daughter * 2.05
             if dist < min_dist and dist > 1e-6:
                 overlap = min_dist - dist
                 n = diff / dist
-                self.body_left.positions -= 0.10 * overlap * n
-                self.body_right.positions += 0.10 * overlap * n
+                self.body_left.positions -= 0.06 * overlap * n
+                self.body_right.positions += 0.06 * overlap * n
 
 
 def run_headless(args):
@@ -732,7 +783,7 @@ def main():
             elif sim.state == CellDivisionState.CONSTRICTING:
                 imgui.Text(f"Furrow Constriction: {sim.furrow_prog * 100:.1f}%")
         else:
-            imgui.Text(f"Relaxation Steps: {sim.relax_step_count} / 40")
+            imgui.Text(f"Relaxation Steps: {sim.relax_step_count} / 50")
 
         imgui.SeparatorText("Simulation Parameters")
         _, sim.push_speed = imgui.SliderFloat(
