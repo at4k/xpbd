@@ -124,7 +124,7 @@ class CellDivisionSim:
 
         # Spindle parameters (two centrosomes separating inside the cell)
         # Closer daughter distance so lobes remain in close contact across cleavage furrow
-        self.d_max = self.r_daughter * 0.55  # ~0.22 (lobes in close contact)
+        self.d_max = self.r_daughter * 0.65  # ~0.26 (lobes in close contact)
         self.d_init = self.r_daughter * 0.15  # ~0.06
         self.spindle_dist = self.d_init
 
@@ -261,9 +261,15 @@ class CellDivisionSim:
         return surf, pts
 
     def _clamp_particles_inside_daughter(
-        self, pts: np.ndarray, center: np.ndarray, max_radius: float
+        self,
+        body: SoftBody,
+        n_surf: int,
+        center: np.ndarray,
+        max_radius: float,
+        is_left: bool,
     ) -> None:
-        """Strictly ensures internal particles cannot escape the daughter cell sphere."""
+        """Strictly ensures internal particles cannot escape the daughter cell sphere or cross the contact plane."""
+        pts = body.positions[n_surf:]
         if len(pts) == 0:
             return
         diff = pts - center
@@ -275,6 +281,14 @@ class CellDivisionSim:
                 + diff[escaped]
                 * (max_radius / np.maximum(dists[escaped], 1e-12))[:, None]
             )
+        # Keep left particles strictly on left side of contact plane (x <= -0.015)
+        # and right particles strictly on right side (x >= +0.015)
+        if is_left:
+            pts[pts[:, 0] > -0.015, 0] = -0.015
+        else:
+            pts[pts[:, 0] < 0.015, 0] = 0.015
+        # Zero out particle velocities so they cannot accumulate momentum or drift
+        body.velocities[n_surf:] = 0.0
 
     def execute_division(self):
         """Topological separation into two independent SoftBodies."""
@@ -420,29 +434,14 @@ class CellDivisionSim:
                 return
 
         else:
-            # Phase 4: Post-division Rounding, Relaxation & Separation
+            # Phase 4: Post-division Relaxation & Contact State
+            c_l = np.mean(self.body_left.positions[: self.n_surf_l], axis=0)
+            c_r = np.mean(self.body_right.positions[: self.n_surf_r], axis=0)
+
             if self.state == CellDivisionState.RELAXING:
                 self.relax_step_count += 1
 
-                c_l = np.mean(self.body_left.positions[: self.n_surf_l], axis=0)
-                c_r = np.mean(self.body_right.positions[: self.n_surf_r], axis=0)
-
-                # Active spherical rounding: daughter cells round out from cut plane towards full spheres
-                v_l = self.body_left.positions[: self.n_surf_l] - c_l
-                r_l = np.linalg.norm(v_l, axis=1)
-                target_r_l = r_l + (self.r_daughter - r_l) * 0.08
-                self.body_left.positions[: self.n_surf_l] = c_l + (
-                    v_l / np.maximum(r_l[:, None], 1e-12)
-                ) * target_r_l[:, None]
-
-                v_r = self.body_right.positions[: self.n_surf_r] - c_r
-                r_r = np.linalg.norm(v_r, axis=1)
-                target_r_r = r_r + (self.r_daughter - r_r) * 0.08
-                self.body_right.positions[: self.n_surf_r] = c_r + (
-                    v_r / np.maximum(r_r[:, None], 1e-12)
-                ) * target_r_r[:, None]
-
-                # Tangential surface relaxation to optimize point distribution on the rounding membrane
+                # Tangential surface relaxation on both daughter meshes (point arrangement optimization)
                 rel_l = tangential_surface_relaxation(
                     self.body_left.positions[: self.n_surf_l],
                     self.faces_left,
@@ -461,57 +460,11 @@ class CellDivisionSim:
                 )
                 self.body_right.positions[: self.n_surf_r] = rel_r
 
-                # Adapt edge rest lengths smoothly to the rounding configuration
-                d_l = (
-                    self.body_left.positions[self.body_left.edges[:, 1]]
-                    - self.body_left.positions[self.body_left.edges[:, 0]]
-                )
-                self.dist_con_l.rest_lengths = (
-                    self.dist_con_l.rest_lengths * 0.85
-                    + np.linalg.norm(d_l, axis=1) * 0.15
-                )
+                # Damp membrane velocities during relaxation
+                self.body_left.velocities[: self.n_surf_l] *= 0.5
+                self.body_right.velocities[: self.n_surf_r] *= 0.5
 
-                d_r = (
-                    self.body_right.positions[self.body_right.edges[:, 1]]
-                    - self.body_right.positions[self.body_right.edges[:, 0]]
-                )
-                self.dist_con_r.rest_lengths = (
-                    self.dist_con_r.rest_lengths * 0.85
-                    + np.linalg.norm(d_r, axis=1) * 0.15
-                )
-
-                # Update volume constraint rest volumes to match the expanding round sphere
-                p1_l = self.body_left.positions[self.faces_left[:, 0]]
-                p2_l = self.body_left.positions[self.faces_left[:, 1]]
-                p3_l = self.body_left.positions[self.faces_left[:, 2]]
-                self.vol_con_l.rest_volumes[0] = (
-                    np.sum(np.einsum("ij,ij->i", np.cross(p1_l, p2_l), p3_l)) / 6.0
-                )
-
-                p1_r = self.body_right.positions[self.faces_right[:, 0]]
-                p2_r = self.body_right.positions[self.faces_right[:, 1]]
-                p3_r = self.body_right.positions[self.faces_right[:, 2]]
-                self.vol_con_r.rest_volumes[0] = (
-                    np.sum(np.einsum("ij,ij->i", np.cross(p1_r, p2_r), p3_r)) / 6.0
-                )
-
-                # Damp velocities during relaxation
-                self.body_left.velocities *= 0.5
-                self.body_right.velocities *= 0.5
-
-                # Enforce internal particle confinement inside daughter spheres
-                if self.n_int_l > 0:
-                    int_l = self.body_left.positions[self.n_surf_l :]
-                    self._clamp_particles_inside_daughter(
-                        int_l, c_l, self.r_daughter * 0.82
-                    )
-                if self.n_int_r > 0:
-                    int_r = self.body_right.positions[self.n_surf_r :]
-                    self._clamp_particles_inside_daughter(
-                        int_r, c_r, self.r_daughter * 0.82
-                    )
-
-                if self.relax_step_count >= 50:
+                if self.relax_step_count >= 40:
                     # Finalize edge rest lengths to relaxed shape
                     d_l = (
                         self.body_left.positions[self.body_left.edges[:, 1]]
@@ -527,20 +480,44 @@ class CellDivisionSim:
 
                     self.state = CellDivisionState.INDEPENDENT
 
+            # Enforce internal particle confinement and zero out particle velocities
+            if self.n_int_l > 0:
+                self._clamp_particles_inside_daughter(
+                    self.body_left,
+                    self.n_surf_l,
+                    c_l,
+                    self.r_daughter * 0.75,
+                    is_left=True,
+                )
+            if self.n_int_r > 0:
+                self._clamp_particles_inside_daughter(
+                    self.body_right,
+                    self.n_surf_r,
+                    c_r,
+                    self.r_daughter * 0.75,
+                    is_left=False,
+                )
+
             self.solver_left.step(DT)
             self.solver_right.step(DT)
 
-            # Smooth mutual collision separation between daughter cells as they round up
-            c_l = np.mean(self.body_left.positions[: self.n_surf_l], axis=0)
-            c_r = np.mean(self.body_right.positions[: self.n_surf_r], axis=0)
-            diff = c_r - c_l
-            dist = float(np.linalg.norm(diff))
-            min_dist = self.r_daughter * 2.05
-            if dist < min_dist and dist > 1e-6:
-                overlap = min_dist - dist
-                n = diff / dist
-                self.body_left.positions -= 0.06 * overlap * n
-                self.body_right.positions += 0.06 * overlap * n
+            # Re-enforce internal particle confinement after solver step
+            if self.n_int_l > 0:
+                self._clamp_particles_inside_daughter(
+                    self.body_left,
+                    self.n_surf_l,
+                    c_l,
+                    self.r_daughter * 0.75,
+                    is_left=True,
+                )
+            if self.n_int_r > 0:
+                self._clamp_particles_inside_daughter(
+                    self.body_right,
+                    self.n_surf_r,
+                    c_r,
+                    self.r_daughter * 0.75,
+                    is_left=False,
+                )
 
 
 def run_headless(args):
@@ -783,7 +760,7 @@ def main():
             elif sim.state == CellDivisionState.CONSTRICTING:
                 imgui.Text(f"Furrow Constriction: {sim.furrow_prog * 100:.1f}%")
         else:
-            imgui.Text(f"Relaxation Steps: {sim.relax_step_count} / 50")
+            imgui.Text(f"Relaxation Steps: {sim.relax_step_count} / 40")
 
         imgui.SeparatorText("Simulation Parameters")
         _, sim.push_speed = imgui.SliderFloat(
