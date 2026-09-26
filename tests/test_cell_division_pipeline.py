@@ -144,3 +144,66 @@ def test_full_cell_division_lifecycle():
 
     assert not np.any(np.isnan(body_l.positions))
     assert not np.any(np.isnan(body_r.positions))
+
+
+def test_cell_division_sim_example():
+    import argparse
+    import sys
+    from pathlib import Path
+
+    root_dir = str(Path(__file__).resolve().parent.parent)
+    if root_dir not in sys.path:
+        sys.path.insert(0, root_dir)
+
+    from examples.cell_division import CellDivisionSim, CellDivisionState
+
+    args = argparse.Namespace(
+        subdivisions=2,
+        bag_radius=0.5,
+        internal_particles=60,
+        substeps=20,
+        mode="jacobi",
+        transparency=0.45,
+        point_radius=0.015,
+        headless=True,
+        headless_steps=300,
+    )
+    sim = CellDivisionSim(args, (-1.5, 0.0, -1.5), (1.5, 3.0, 1.5))
+    sim.push_speed = 0.55
+    sim.constrict_speed = 0.55
+
+    # Run through full cycle
+    for i in range(300):
+        sim.step()
+        if sim.is_divided:
+            # Verify velocities remain stable without explosive divergence
+            vel_l = np.max(np.linalg.norm(sim.body_left.velocities, axis=1))
+            vel_r = np.max(np.linalg.norm(sim.body_right.velocities, axis=1))
+            assert vel_l < 5.0, f"Step {i}: Left daughter velocity exploded: {vel_l}"
+            assert vel_r < 5.0, f"Step {i}: Right daughter velocity exploded: {vel_r}"
+
+    assert sim.is_divided
+    assert sim.state == CellDivisionState.INDEPENDENT
+
+    # Verify daughter cells are rounded/spherical rather than skinny hotdogs
+    pos_l = sim.body_left.positions[: sim.n_surf_l]
+    span_x = np.max(pos_l[:, 0]) - np.min(pos_l[:, 0])
+    span_y = np.max(pos_l[:, 1]) - np.min(pos_l[:, 1])
+    span_z = np.max(pos_l[:, 2]) - np.min(pos_l[:, 2])
+    aspect_xy = span_x / span_y
+    aspect_xz = span_x / span_z
+    assert 0.75 < aspect_xy < 1.35, f"Left daughter not spherical: aspect_xy={aspect_xy:.2f}"
+    assert 0.75 < aspect_xz < 1.35, f"Left daughter not spherical: aspect_xz={aspect_xz:.2f}"
+
+    # Verify internal particles are strictly confined inside daughter cells
+    c_l = np.mean(pos_l, axis=0)
+    int_l = sim.body_left.positions[sim.n_surf_l :]
+    dist_l = np.linalg.norm(int_l - c_l, axis=1)
+    assert np.all(dist_l < sim.r_daughter * 1.05), "Internal particles escaped left daughter"
+
+    # Verify reset/rewind functionality
+    sim.reset()
+    assert sim.state == CellDivisionState.ELONGATING
+    assert not sim.is_divided
+    assert sim.time == 0.0
+

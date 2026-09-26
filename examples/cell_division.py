@@ -15,7 +15,6 @@ from xpbd.constraints import (
     BoxConstraint,
     DistanceConstraint,
     GlobalVolumeConstraint,
-    ParticleCollisionConstraint,
 )
 from xpbd.mesh import edges_from_faces, icosphere_mesh
 from xpbd.topology import (
@@ -57,28 +56,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def generate_internal_particles(origin, radius, num_particles):
+    """Generates internal cytoplasm particles strictly bounded within a spherical radius."""
     if num_particles <= 0:
         return np.zeros((0, 3), dtype=np.float64)
-    r_max = radius * 0.75
-    side = int(np.ceil(num_particles ** (1.0 / 3.0)))
-    if side < 2:
-        side = 2
-    grid_1d = np.linspace(-r_max, r_max, side)
-    gx, gy, gz = np.meshgrid(grid_1d, grid_1d, grid_1d, indexing="ij")
-    pts = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3)
-    dists = np.linalg.norm(pts, axis=1)
-    inside = pts[dists <= r_max]
-    if len(inside) > num_particles:
-        indices = np.linspace(0, len(inside) - 1, num_particles, dtype=int)
-        inside = inside[indices]
-    elif len(inside) < num_particles:
-        np.random.seed(123)
-        while len(inside) < num_particles:
-            vec = np.random.uniform(-r_max, r_max, size=(num_particles * 2, 3))
-            norms = np.linalg.norm(vec, axis=1)
-            valid = vec[norms <= r_max]
-            inside = np.concatenate([inside, valid], axis=0)[:num_particles]
-    return inside + np.asarray(origin, dtype=np.float64)
+    r_max = radius * 0.70
+    np.random.seed(42)
+    inside = []
+    while len(inside) < num_particles:
+        cand = np.random.uniform(-r_max, r_max, size=(num_particles * 2, 3))
+        valid = cand[np.linalg.norm(cand, axis=1) <= r_max]
+        inside.extend(valid)
+    pts = np.array(inside[:num_particles], dtype=np.float64)
+    return pts + np.asarray(origin, dtype=np.float64)
 
 
 class CellDivisionSim:
@@ -90,11 +79,13 @@ class CellDivisionSim:
         self.bounds_max = np.asarray(bounds_max, dtype=np.float64)
         self.origin = np.array([0.0, 1.5, 0.0], dtype=np.float64)
         self.r_cell = args.bag_radius
+        self.r_daughter = self.r_cell / (2.0 ** (1.0 / 3.0))  # ~0.3969 for r_cell=0.5
 
-        self.push_speed = 0.35
-        self.constrict_speed = 0.35
-        self.relax_factor = 0.18
-        self.spindle_radius = 0.035
+        # Speed parameters
+        self.push_speed = 0.55
+        self.constrict_speed = 0.55
+        self.relax_factor = 0.15
+        self.spindle_radius = 0.030
 
         self.reset()
 
@@ -105,41 +96,45 @@ class CellDivisionSim:
         self.is_divided = False
         self.time = 0.0
 
-        # Initial sphere mesh
+        # Progress tracking
+        self.elong_prog = 0.0
+        self.furrow_prog = 0.0
+
+        # Initial mother sphere mesh
         self.base_surf_pos, self.faces = icosphere_mesh(
             subdivisions=self.args.subdivisions, radius=self.r_cell, origin=self.origin
         )
         self.n_surf = len(self.base_surf_pos)
         self.edges = edges_from_faces(self.faces)
-
-        # Current working surface positions
         self.cur_surf_pos = self.base_surf_pos.copy()
 
-        # Initial internal fluid particles
+        # Normalized coordinates relative to origin (unit sphere)
+        self.u_surf = (self.base_surf_pos - self.origin) / self.r_cell
+
+        # Initial internal cytoplasm particles
         self.base_internal_pos = generate_internal_particles(
             self.origin, self.r_cell, self.args.internal_particles
         )
         self.n_internal = len(self.base_internal_pos)
         self.cur_internal_pos = self.base_internal_pos.copy()
+        if self.n_internal > 0:
+            self.u_internal = (self.base_internal_pos - self.origin) / self.r_cell
+        else:
+            self.u_internal = np.zeros((0, 3), dtype=np.float64)
 
-        # Spindle parameters
-        self.spindle_len_init = self.r_cell * 0.40
-        self.spindle_len_max = self.r_cell * 1.50
-        self.spindle_len = self.spindle_len_init
+        # Spindle parameters (two centrosomes separating inside the cell)
+        self.d_max = self.r_daughter * 0.90  # ~0.36
+        self.d_init = self.r_daughter * 0.20  # ~0.08
+        self.spindle_dist = self.d_init
 
-        # Pole positions
         self.pole_0 = np.array(
-            [self.origin[0] - self.spindle_len / 2.0, self.origin[1], self.origin[2]],
+            [self.origin[0] - self.spindle_dist, self.origin[1], self.origin[2]],
             dtype=np.float64,
         )
         self.pole_1 = np.array(
-            [self.origin[0] + self.spindle_len / 2.0, self.origin[1], self.origin[2]],
+            [self.origin[0] + self.spindle_dist, self.origin[1], self.origin[2]],
             dtype=np.float64,
         )
-
-        # Furrow constriction parameter
-        self.furrow_prog = 0.0  # 0.0 = unconstricted, 1.0 = fully pinched
-        self.furrow_radius = self.r_cell
 
         # Mother SoftBody container
         total_pos = np.concatenate(
@@ -187,31 +182,102 @@ class CellDivisionSim:
         self.n_int_l = 0
         self.n_int_r = 0
 
-    def _clamp_particles_inside_surface(
-        self, pts: np.ndarray, surf: np.ndarray, center: np.ndarray, margin: float = 0.85
+    def _compute_deformed_geometry(self, elong_t: float, constrict_t: float):
+        """Computes the physiologically realistic two-lobed morphology and internal positions.
+
+        During elongation and constriction, the cell maintains rounded spherical daughter lobes
+        centered at the separating spindle poles rather than a thin elongated sausage.
+        """
+        d = self.d_init + (self.d_max - self.d_init) * elong_t
+        r_eff = self.r_cell + (self.r_daughter - self.r_cell) * elong_t
+
+        # 1. Surface deformation
+        sign_x = np.sign(self.u_surf[:, 0])
+        abs_ux = np.abs(self.u_surf[:, 0])
+        x = sign_x * (abs_ux * r_eff + d * (abs_ux ** 0.8))
+
+        r_yz_base = np.sqrt(self.u_surf[:, 1] ** 2 + self.u_surf[:, 2] ** 2)
+        r_yz = r_yz_base * r_eff
+
+        # Furrow constriction near x = 0
+        waist_width = r_eff * 0.75
+        w = np.clip(np.abs(x) / waist_width, 0.0, 1.0)
+        smooth_w = w * w * (3.0 - 2.0 * w)
+        neck_ratio = 1.0 - constrict_t * (1.0 - 0.06)
+        scale_neck = neck_ratio + (1.0 - neck_ratio) * smooth_w
+        r_yz_final = r_yz * scale_neck
+
+        norm_yz = np.sqrt(self.u_surf[:, 1] ** 2 + self.u_surf[:, 2] ** 2)
+        dir_yz = np.zeros((self.n_surf, 2), dtype=np.float64)
+        val = norm_yz > 1e-12
+        dir_yz[val] = self.u_surf[val, 1:3] / norm_yz[val, None]
+
+        surf = np.zeros_like(self.base_surf_pos)
+        surf[:, 0] = self.origin[0] + x
+        surf[:, 1] = self.origin[1] + dir_yz[:, 0] * r_yz_final
+        surf[:, 2] = self.origin[2] + dir_yz[:, 1] * r_yz_final
+
+        # 2. Internal cytoplasm particles
+        if self.n_internal > 0:
+            sign_xi = np.sign(self.u_internal[:, 0])
+            abs_uxi = np.abs(self.u_internal[:, 0])
+            xi = sign_xi * (abs_uxi * r_eff + d * (abs_uxi ** 0.8))
+
+            # Push cytoplasm away from the pinching equator into the two lobes
+            near_eq = np.abs(xi) < waist_width * 0.70
+            xi[near_eq] += (
+                np.where(sign_xi[near_eq] >= 0, 1.0, -1.0)
+                * constrict_t
+                * 0.08
+            )
+
+            # Neck constriction for internal particles
+            wi = np.clip(np.abs(xi) / waist_width, 0.0, 1.0)
+            smooth_wi = wi * wi * (3.0 - 2.0 * wi)
+            scale_neck_i = neck_ratio + (1.0 - neck_ratio) * smooth_wi
+
+            r_yzi = (
+                np.sqrt(self.u_internal[:, 1] ** 2 + self.u_internal[:, 2] ** 2)
+                * r_eff
+                * scale_neck_i
+            )
+            norm_yzi = np.sqrt(
+                self.u_internal[:, 1] ** 2 + self.u_internal[:, 2] ** 2
+            )
+            dir_yzi = np.zeros((self.n_internal, 2), dtype=np.float64)
+            val_i = norm_yzi > 1e-12
+            dir_yzi[val_i] = self.u_internal[val_i, 1:3] / norm_yzi[val_i, None]
+
+            pts = np.zeros_like(self.base_internal_pos)
+            pts[:, 0] = self.origin[0] + xi
+            pts[:, 1] = self.origin[1] + dir_yzi[:, 0] * r_yzi
+            pts[:, 2] = self.origin[2] + dir_yzi[:, 1] * r_yzi
+        else:
+            pts = np.zeros((0, 3), dtype=np.float64)
+
+        return surf, pts
+
+    def _clamp_particles_inside_daughter(
+        self, pts: np.ndarray, center: np.ndarray, max_radius: float
     ) -> None:
-        """Strictly clamps internal particles so none can ever escape the cell membrane."""
+        """Strictly ensures internal particles cannot escape the daughter cell sphere."""
         if len(pts) == 0:
             return
-        diff = pts[:, None, :] - surf[None, :, :]
-        dist_sq = np.sum(diff**2, axis=-1)
-        nearest = np.argmin(dist_sq, axis=1)
-
-        v_pts = pts - center
-        r_pts = np.linalg.norm(v_pts, axis=1)
-        r_surf_near = np.linalg.norm(surf[nearest] - center, axis=1)
-        r_max = r_surf_near * margin
-
-        escaped = r_pts > r_max
+        diff = pts - center
+        dists = np.linalg.norm(diff, axis=1)
+        escaped = dists > max_radius
         if np.any(escaped):
-            scale = (r_max[escaped] / np.maximum(r_pts[escaped], 1e-12))[:, None]
-            pts[escaped] = center + v_pts[escaped] * scale
+            pts[escaped] = (
+                center
+                + diff[escaped]
+                * (max_radius / np.maximum(dists[escaped], 1e-12))[:, None]
+            )
 
     def execute_division(self):
         """Topological separation into two independent SoftBodies."""
         cur_surf = self.mother_body.positions[: self.n_surf]
 
-        # Slicing at the exact cleavage furrow midpoint
+        # Slicing at the exact cleavage furrow midpoint x = origin[0]
         cut_x = float(self.origin[0])
         (pos_l, self.faces_left), (pos_r, self.faces_right) = slice_and_cap_mesh(
             cur_surf, self.faces, cut_x=cut_x
@@ -219,7 +285,7 @@ class CellDivisionSim:
         self.n_surf_l = len(pos_l)
         self.n_surf_r = len(pos_r)
 
-        # Partition internal particles
+        # Partition internal particles strictly by cut plane
         if self.n_internal > 0:
             int_pos = self.mother_body.positions[self.n_surf :]
             l_int_idx, r_int_idx = partition_particles(int_pos, cut_x=cut_x)
@@ -250,7 +316,7 @@ class CellDivisionSim:
         if self.n_int_r > 0:
             inv_m_r[self.n_surf_r :] = 2.0
 
-        # Construct 2 distinct SoftBody instances
+        # Construct 2 distinct SoftBody instances initialized with zero velocities
         self.body_left = SoftBody(
             positions=total_l,
             velocities=np.zeros_like(total_l),
@@ -266,7 +332,6 @@ class CellDivisionSim:
             edges=edges_r,
         )
 
-        target_vol = self.initial_volume * 0.5
         self.dist_con_l = DistanceConstraint.from_positions(
             self.body_left.positions, edges_l, compliance=1e-3
         )
@@ -274,11 +339,12 @@ class CellDivisionSim:
             self.body_right.positions, edges_r, compliance=1e-3
         )
 
-        vol_con_l = GlobalVolumeConstraint(
-            [self.faces_left], [target_vol], compliance=0.0
+        # Rest volume initialized from the newly capped daughter meshes to eliminate velocity spikes
+        vol_con_l = GlobalVolumeConstraint.from_positions(
+            self.body_left.positions, [self.faces_left], compliance=0.0
         )
-        vol_con_r = GlobalVolumeConstraint(
-            [self.faces_right], [target_vol], compliance=0.0
+        vol_con_r = GlobalVolumeConstraint.from_positions(
+            self.body_right.positions, [self.faces_right], compliance=0.0
         )
 
         box_l = BoxConstraint(len(total_l), self.bounds_min, self.bounds_max)
@@ -309,32 +375,22 @@ class CellDivisionSim:
         if not self.is_divided:
             # Phase 1: Spindle Elongation
             if self.state == CellDivisionState.ELONGATING:
-                self.spindle_len += self.push_speed * DT
-                if self.spindle_len >= self.spindle_len_max:
-                    self.spindle_len = self.spindle_len_max
+                self.elong_prog += self.push_speed * DT
+                if self.elong_prog >= 1.0:
+                    self.elong_prog = 1.0
                     self.state = CellDivisionState.CONSTRICTING
 
-                # Update poles
-                self.pole_0[0] = self.origin[0] - self.spindle_len / 2.0
-                self.pole_1[0] = self.origin[0] + self.spindle_len / 2.0
+                self.spindle_dist = (
+                    self.d_init + (self.d_max - self.d_init) * self.elong_prog
+                )
+                self.pole_0[0] = self.origin[0] - self.spindle_dist
+                self.pole_1[0] = self.origin[0] + self.spindle_dist
 
-                # Elongation deformation: prolate transformation preserving volume
-                s_x = self.spindle_len / self.spindle_len_init
-                s_yz = 1.0 / np.sqrt(s_x)
-
-                surf = self.base_surf_pos.copy()
-                surf[:, 0] = self.origin[0] + (self.base_surf_pos[:, 0] - self.origin[0]) * s_x
-                surf[:, 1] = self.origin[1] + (self.base_surf_pos[:, 1] - self.origin[1]) * s_yz
-                surf[:, 2] = self.origin[2] + (self.base_surf_pos[:, 2] - self.origin[2]) * s_yz
+                surf, pts = self._compute_deformed_geometry(
+                    self.elong_prog, 0.0
+                )
                 self.mother_body.positions[: self.n_surf] = surf
-
-                # Internal particles scale with cell
                 if self.n_internal > 0:
-                    pts = self.base_internal_pos.copy()
-                    pts[:, 0] = self.origin[0] + (self.base_internal_pos[:, 0] - self.origin[0]) * s_x
-                    pts[:, 1] = self.origin[1] + (self.base_internal_pos[:, 1] - self.origin[1]) * s_yz
-                    pts[:, 2] = self.origin[2] + (self.base_internal_pos[:, 2] - self.origin[2]) * s_yz
-                    self._clamp_particles_inside_surface(pts, surf, self.origin)
                     self.mother_body.positions[self.n_surf :] = pts
 
             # Phase 2: Cleavage Furrow Constriction
@@ -344,46 +400,15 @@ class CellDivisionSim:
                     self.furrow_prog = 1.0
                     self.state = CellDivisionState.DIVIDING
 
-                # Compute prolate base at max elongation
-                s_x = self.spindle_len_max / self.spindle_len_init
-                s_yz = 1.0 / np.sqrt(s_x)
+                self.spindle_dist = self.d_max
+                self.pole_0[0] = self.origin[0] - self.spindle_dist
+                self.pole_1[0] = self.origin[0] + self.spindle_dist
 
-                base_surf = self.base_surf_pos.copy()
-                base_surf[:, 0] = self.origin[0] + (self.base_surf_pos[:, 0] - self.origin[0]) * s_x
-                base_surf[:, 1] = self.origin[1] + (self.base_surf_pos[:, 1] - self.origin[1]) * s_yz
-                base_surf[:, 2] = self.origin[2] + (self.base_surf_pos[:, 2] - self.origin[2]) * s_yz
-
-                dx = base_surf[:, 0] - self.origin[0]
-                dy = base_surf[:, 1] - self.origin[1]
-                dz = base_surf[:, 2] - self.origin[2]
-                r_yz = np.sqrt(dy**2 + dz**2)
-
-                # Smooth furrow pinch
-                waist_w = self.r_cell * 0.70
-                w_factor = np.clip(np.abs(dx) / waist_w, 0.0, 1.0)
-                smooth_w = w_factor * w_factor * (3.0 - 2.0 * w_factor)
-
-                r_min = s_yz * self.r_cell
-                target_neck = 0.04 + (r_min - 0.04) * (1.0 - self.furrow_prog)
-                r_new = target_neck + (r_yz - target_neck) * smooth_w
-                scale_yz = r_new / np.maximum(r_yz, 1e-12)
-
-                surf = base_surf.copy()
-                surf[:, 1] = self.origin[1] + dy * scale_yz
-                surf[:, 2] = self.origin[2] + dz * scale_yz
+                surf, pts = self._compute_deformed_geometry(
+                    1.0, self.furrow_prog
+                )
                 self.mother_body.positions[: self.n_surf] = surf
-
-                # Internal particles
                 if self.n_internal > 0:
-                    pts = self.mother_body.positions[self.n_surf :].copy()
-                    # Push particles away from the pinching equator into daughter lobes
-                    near_waist = np.abs(pts[:, 0] - self.origin[0]) < waist_w * 0.8
-                    if np.any(near_waist):
-                        push_dir = np.sign(pts[near_waist, 0] - self.origin[0])
-                        push_dir[push_dir == 0] = 1.0
-                        pts[near_waist, 0] += push_dir * 0.01
-
-                    self._clamp_particles_inside_surface(pts, surf, self.origin)
                     self.mother_body.positions[self.n_surf :] = pts
 
             # Phase 3: Division Trigger
@@ -392,7 +417,7 @@ class CellDivisionSim:
                 return
 
         else:
-            # Post-division
+            # Phase 4: Post-division Relaxation & Separation
             if self.state == CellDivisionState.RELAXING:
                 self.relax_step_count += 1
 
@@ -403,30 +428,36 @@ class CellDivisionSim:
                     self.faces_left,
                     center=c_l,
                     factor=self.relax_factor,
-                    n_iters=2,
+                    n_iters=1,
                 )
                 self.body_left.positions[: self.n_surf_l] = rel_l
 
-                c_r = np.mean(self.body_right.positions[: self.n_surf_r], axis=0)
+                c_r = np.mean(
+                    self.body_right.positions[: self.n_surf_r], axis=0
+                )
                 rel_r = tangential_surface_relaxation(
                     self.body_right.positions[: self.n_surf_r],
                     self.faces_right,
                     center=c_r,
                     factor=self.relax_factor,
-                    n_iters=2,
+                    n_iters=1,
                 )
                 self.body_right.positions[: self.n_surf_r] = rel_r
 
-                # Clamp internal particles inside each daughter sphere
+                # Damp velocities during relaxation
+                self.body_left.velocities *= 0.5
+                self.body_right.velocities *= 0.5
+
+                # Enforce internal particle confinement inside daughter spheres
                 if self.n_int_l > 0:
                     int_l = self.body_left.positions[self.n_surf_l :]
-                    self._clamp_particles_inside_surface(
-                        int_l, self.body_left.positions[: self.n_surf_l], c_l
+                    self._clamp_particles_inside_daughter(
+                        int_l, c_l, self.r_daughter * 0.82
                     )
                 if self.n_int_r > 0:
                     int_r = self.body_right.positions[self.n_surf_r :]
-                    self._clamp_particles_inside_surface(
-                        int_r, self.body_right.positions[: self.n_surf_r], c_r
+                    self._clamp_particles_inside_daughter(
+                        int_r, c_r, self.r_daughter * 0.82
                     )
 
                 if self.relax_step_count >= 40:
@@ -448,17 +479,17 @@ class CellDivisionSim:
             self.solver_left.step(DT)
             self.solver_right.step(DT)
 
-            # Mutual collision separation between daughter cells
+            # Smooth mutual collision separation between daughter cells
             c_l = np.mean(self.body_left.positions[: self.n_surf_l], axis=0)
             c_r = np.mean(self.body_right.positions[: self.n_surf_r], axis=0)
             diff = c_r - c_l
             dist = float(np.linalg.norm(diff))
-            min_dist = self.r_cell * 0.95
+            min_dist = self.r_daughter * 1.95
             if dist < min_dist and dist > 1e-6:
                 overlap = min_dist - dist
                 n = diff / dist
-                self.body_left.positions -= 0.5 * overlap * n
-                self.body_right.positions += 0.5 * overlap * n
+                self.body_left.positions -= 0.10 * overlap * n
+                self.body_right.positions += 0.10 * overlap * n
 
 
 def run_headless(args):
@@ -533,7 +564,7 @@ def main():
     ps.set_up_dir("y_up")
     register_box_wireframe(bounds_min, bounds_max)
 
-    # Initial mother cell meshes
+    # Initial mother cell visuals
     mesh_mother = ps.register_surface_mesh(
         "cell_membrane",
         sim.mother_body.positions[: sim.n_surf],
@@ -553,13 +584,21 @@ def main():
         cloud_mother.set_color((0.30, 0.70, 0.90))
         cloud_mother.set_radius(point_radius)
 
-    # Spindle rod (central cylinder connecting the two poles)
+    # Central mitotic spindle rod connecting centrosomes
     spindle_curve = ps.register_curve_network(
         "spindle_apparatus",
         np.array([sim.pole_0, sim.pole_1]),
         np.array([[0, 1]]),
         radius=sim.spindle_radius,
-        color=(0.95, 0.30, 0.30),
+        color=(0.95, 0.25, 0.25),
+    )
+
+    # Centrosomes (spindle poles)
+    centrosomes = ps.register_point_cloud(
+        "centrosomes",
+        np.array([sim.pole_0, sim.pole_1]),
+        radius=sim.spindle_radius * 1.8,
+        color=(1.0, 0.85, 0.20),
     )
 
     mesh_l = None
@@ -580,12 +619,16 @@ def main():
             spindle_curve.update_node_positions(
                 np.array([sim.pole_0, sim.pole_1])
             )
+            centrosomes.update_point_positions(
+                np.array([sim.pole_0, sim.pole_1])
+            )
         else:
             if mesh_mother.is_enabled():
                 mesh_mother.set_enabled(False)
                 if cloud_mother:
                     cloud_mother.set_enabled(False)
                 spindle_curve.set_enabled(False)
+                centrosomes.set_enabled(False)
 
                 mesh_l = ps.register_surface_mesh(
                     "daughter_left",
@@ -644,16 +687,7 @@ def main():
         nonlocal is_running, transparency, point_radius, mesh_l, mesh_r, cloud_l, cloud_r
         import polyscope.imgui as imgui
 
-        # State and progress display
-        imgui.Text(f"Current Phase: {sim.state.value}")
-        if not sim.is_divided:
-            imgui.Text(f"Spindle Length: {sim.spindle_len:.3f} / {sim.spindle_len_max:.3f}")
-            if sim.state == CellDivisionState.CONSTRICTING:
-                imgui.Text(f"Furrow Constriction: {sim.furrow_prog * 100:.1f}%")
-        else:
-            imgui.Text(f"Relaxation Steps: {sim.relax_step_count} / 40")
-
-        # Action Buttons
+        # Prominent rewind and control bar
         if imgui.Button("最初に戻る (Rewind to Start)"):
             sim.reset()
             if mesh_mother:
@@ -662,6 +696,8 @@ def main():
                 cloud_mother.set_enabled(True)
             if spindle_curve:
                 spindle_curve.set_enabled(True)
+            if centrosomes:
+                centrosomes.set_enabled(True)
             if mesh_l:
                 ps.remove_surface_mesh("daughter_left")
             if mesh_r:
@@ -671,6 +707,7 @@ def main():
             if cloud_r:
                 ps.remove_point_cloud("fluid_right")
             mesh_l = mesh_r = cloud_l = cloud_r = None
+            update_visuals()
 
         imgui.SameLine()
         if imgui.Button("Pause" if is_running else "Play"):
@@ -680,13 +717,27 @@ def main():
         if imgui.Button("Step"):
             is_running = False
             sim.step()
+            update_visuals()
 
         imgui.SameLine()
         if imgui.Button("Force Divide") and not sim.is_divided:
             sim.execute_division()
+            update_visuals()
+
+        imgui.SeparatorText("Simulation Status")
+        imgui.Text(f"Phase: {sim.state.value}")
+        if not sim.is_divided:
+            if sim.state == CellDivisionState.ELONGATING:
+                imgui.Text(f"Spindle Elongation: {sim.elong_prog * 100:.1f}%")
+            elif sim.state == CellDivisionState.CONSTRICTING:
+                imgui.Text(f"Furrow Constriction: {sim.furrow_prog * 100:.1f}%")
+        else:
+            imgui.Text(f"Relaxation Steps: {sim.relax_step_count} / 40")
 
         imgui.SeparatorText("Simulation Parameters")
-        _, sim.push_speed = imgui.SliderFloat("Elongation Speed", sim.push_speed, 0.05, 1.0)
+        _, sim.push_speed = imgui.SliderFloat(
+            "Elongation Speed", sim.push_speed, 0.05, 1.0
+        )
         _, sim.constrict_speed = imgui.SliderFloat(
             "Constriction Speed", sim.constrict_speed, 0.05, 1.0
         )
