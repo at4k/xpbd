@@ -233,25 +233,61 @@ class CellDivisionSim:
 
         # 2. Internal cytoplasm particles
         if self.n_internal > 0:
-            sign_xi = np.where(self.u_internal[:, 0] >= 0, 1.0, -1.0)
-            abs_uxi = np.abs(self.u_internal[:, 0])
+            sign_p = np.where(self.u_internal[:, 0] >= 0, 1.0, -1.0)
             r_yzi_u = np.sqrt(self.u_internal[:, 1] ** 2 + self.u_internal[:, 2] ** 2)
             norm_yzi = np.maximum(r_yzi_u, 1e-12)
             dir_yi = self.u_internal[:, 1] / norm_yzi
             dir_zi = self.u_internal[:, 2] / norm_yzi
 
-            xi = sign_xi * (d * (abs_uxi ** 0.8) + abs_uxi * r_l)
-            abs_xi = np.abs(xi)
-            near_eq = abs_xi < 0.12
-            xi[near_eq] += np.where(sign_xi[near_eq] >= 0, 1.0, -1.0) * constrict_t * 0.04
+            # Continuous axial expansion with spindle elongation
+            # Smooth tanh transition prevents unnatural sudden gap at t=0
+            x_base_p = (
+                self.u_internal[:, 0] * r_l
+                + d * np.tanh(3.0 * self.u_internal[:, 0]) * elong_t
+            )
 
-            r_scale = r_yzi_u * (r_l / 1.0)
-            r_final_i = r_scale * (1.0 - constrict_t * 0.3 * np.exp(-abs_xi ** 2 / 0.01))
+            # Cleavage furrow expulsion:
+            # As contractile ring constricts (constrict_t: 0 -> 1), the furrow membrane
+            # physically squeezes particles axially away from x = 0 into the two lobes
+            furrow_push = (
+                sign_p
+                * np.exp(-x_base_p ** 2 / 0.02)
+                * constrict_t
+                * (d * 0.70)
+            )
+            x_p = x_base_p + furrow_push
+
+            # Ensure clear separation as abscission approaches
+            if constrict_t > 0.4:
+                min_sep = 0.035 * (constrict_t - 0.4) / 0.6
+                x_p = np.where(
+                    sign_p < 0, np.minimum(x_p, -min_sep), np.maximum(x_p, min_sep)
+                )
+
+            # Radial confinement inside the deformed membrane:
+            abs_xp = np.abs(x_p)
+            r_mem_p = np.zeros_like(x_p)
+            out_mp = abs_xp >= d
+            dx_out_p = abs_xp[out_mp] - d
+            r_mem_p[out_mp] = np.sqrt(np.maximum(0.0, r_l ** 2 - dx_out_p ** 2))
+
+            in_mp = ~out_mp
+            u_p = abs_xp[in_mp] / max(d, 1e-6)
+            s_p = u_p * u_p * (3.0 - 2.0 * u_p)
+            r_mem_p[in_mp] = r_eq + (r_l - r_eq) * s_p
+
+            xi_p = np.clip(abs_xp / w_furrow, 0.0, 1.0)
+            s_furr_p = xi_p * xi_p * (3.0 - 2.0 * xi_p)
+            scale_neck_p = (neck_r / r_eq) + (1.0 - neck_r / r_eq) * s_furr_p
+            r_mem_final = r_mem_p * scale_neck_p
+
+            # Particle radius in Y-Z dynamically confined by local membrane radius
+            r_target_p = np.minimum(r_yzi_u * r_l, r_mem_final * 0.72)
 
             pts = np.zeros_like(self.base_internal_pos)
-            pts[:, 0] = self.origin[0] + xi
-            pts[:, 1] = self.origin[1] + dir_yi * r_final_i
-            pts[:, 2] = self.origin[2] + dir_zi * r_final_i
+            pts[:, 0] = self.origin[0] + x_p
+            pts[:, 1] = self.origin[1] + dir_yi * r_target_p
+            pts[:, 2] = self.origin[2] + dir_zi * r_target_p
         else:
             pts = np.zeros((0, 3), dtype=np.float64)
 
@@ -686,7 +722,11 @@ def main():
             "internal_fluid",
             sim.mother_body.positions[sim.n_surf :],
         )
-        cloud_mother.set_color((0.30, 0.70, 0.90))
+        lineage_colors = np.zeros((sim.n_internal, 3), dtype=np.float64)
+        is_left_p = sim.u_internal[:, 0] < 0
+        lineage_colors[is_left_p] = (0.20, 0.75, 0.85)   # AB daughter (Cyan)
+        lineage_colors[~is_left_p] = (0.45, 0.85, 0.45)  # P1 daughter (Lime green)
+        cloud_mother.add_color_quantity("cell_lineage", lineage_colors, enabled=True)
         cloud_mother.set_radius(point_radius)
 
     # Central mitotic spindle rod connecting centrosomes
