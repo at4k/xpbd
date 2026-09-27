@@ -207,3 +207,41 @@ def test_cell_division_sim_example():
     assert not sim.is_divided
     assert sim.time == 0.0
 
+
+def test_autonomous_cell_division_volume_conservation():
+    import argparse
+    from examples.cell_division import CellDivisionSim
+
+    args = argparse.Namespace(
+        subdivisions=2,
+        bag_radius=0.5,
+        internal_particles=80,
+        substeps=20,
+        mode="gauss_seidel",
+        transparency=0.45,
+        point_radius=0.015,
+        headless=True,
+        headless_steps=300,
+    )
+    sim = CellDivisionSim(args, (-1.5, 0.0, -1.5), (1.5, 3.0, 1.5))
+    v0 = sim.initial_volume
+
+    # Check volume conservation during elongation & constriction
+    for _ in range(80):
+        sim.step()
+        if not sim.is_divided:
+            p1 = sim.mother_body.positions[sim.faces[:, 0]]
+            p2 = sim.mother_body.positions[sim.faces[:, 1]]
+            p3 = sim.mother_body.positions[sim.faces[:, 2]]
+            cur_vol = np.sum(np.einsum("ij,ij->i", np.cross(p1, p2), p3)) / 6.0
+            np.testing.assert_allclose(cur_vol, v0, rtol=0.01)
+
+    # Step to completion
+    for _ in range(220):
+        sim.step()
+
+    assert sim.is_divided
+    # Verify particles are conserved (no particles lost)
+    assert len(sim.int_l) + len(sim.int_r) == 80
+    assert len(sim.int_l) > 0 and len(sim.int_r) > 0
+
