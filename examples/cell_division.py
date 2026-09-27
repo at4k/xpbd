@@ -38,11 +38,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--subdivisions", type=int, default=2)
     parser.add_argument("--bag-radius", type=float, default=0.5)
-    parser.add_argument("--internal-particles", type=int, default=80)
+    parser.add_argument("--internal-particles", type=int, default=160)
     parser.add_argument("--substeps", type=int, default=20)
     parser.add_argument("--mode", choices=["jacobi", "gauss_seidel"], default="jacobi")
     parser.add_argument("--transparency", type=float, default=0.45)
-    parser.add_argument("--point-radius", type=float, default=0.015)
+    parser.add_argument("--point-radius", type=float, default=0.012)
     parser.add_argument(
         "--headless", action="store_true", help="Run simulation headlessly"
     )
@@ -56,17 +56,53 @@ def parse_args() -> argparse.Namespace:
 
 
 def generate_internal_particles(origin, radius, num_particles):
-    """Generates internal cytoplasm particles strictly bounded within a spherical radius."""
+    """Generates internal cytoplasm particles with uniform, balanced volume density."""
     if num_particles <= 0:
         return np.zeros((0, 3), dtype=np.float64)
-    r_max = radius * 0.70
+    r_max = radius * 0.72
     np.random.seed(42)
-    inside = []
-    while len(inside) < num_particles:
-        cand = np.random.uniform(-r_max, r_max, size=(num_particles * 2, 3))
-        valid = cand[np.linalg.norm(cand, axis=1) <= r_max]
-        inside.extend(valid)
-    pts = np.array(inside[:num_particles], dtype=np.float64)
+
+    n_half = num_particles // 2
+
+    # Sample uniformly in volume within each hemisphere to ensure perfect balance
+    def sample_half(sign):
+        pts = []
+        while len(pts) < n_half * 3:
+            p = np.random.uniform(-r_max, r_max, size=(n_half * 4, 3))
+            dists = np.linalg.norm(p, axis=1)
+            valid = (dists <= r_max) & (p[:, 0] * sign >= 0.015)
+            pts.extend(p[valid])
+            if len(pts) >= n_half:
+                break
+        res = np.array(pts[:n_half], dtype=np.float64)
+
+        # Electrostatic repulsion relaxation to eliminate random density clustering
+        for _ in range(25):
+            diff = res[:, None, :] - res[None, :, :]
+            dist = np.linalg.norm(diff, axis=-1)
+            np.fill_diagonal(dist, np.inf)
+            close = dist < 0.12
+            force = np.zeros_like(res)
+            for i in range(n_half):
+                cl = close[i]
+                if np.any(cl):
+                    d = dist[i, cl, None]
+                    f = (diff[i, cl] / np.maximum(d, 1e-6)) * np.maximum(0.0, 1.0 - d / 0.12)
+                    force[i] = np.sum(f, axis=0)
+            res += force * 0.008
+            dists = np.linalg.norm(res, axis=1)
+            over = dists > r_max
+            if np.any(over):
+                res[over] = res[over] / dists[over, None] * r_max
+            if sign < 0:
+                res[res[:, 0] > -0.015, 0] = -0.015
+            else:
+                res[res[:, 0] < 0.015, 0] = 0.015
+        return res
+
+    pts_l = sample_half(-1.0)
+    pts_r = sample_half(1.0)
+    pts = np.concatenate([pts_l, pts_r], axis=0)
     return pts + np.asarray(origin, dtype=np.float64)
 
 
@@ -111,6 +147,11 @@ class CellDivisionSim:
         # Normalized coordinates relative to origin (unit sphere)
         self.u_surf = (self.base_surf_pos - self.origin) / self.r_cell
 
+        # Spindle parameters (two centrosomes separating inside the cell)
+        self.d_max = self.r_daughter * 0.55  # ~0.22 (lobes in close contact)
+        self.d_init = self.r_daughter * 0.15  # ~0.06
+        self.spindle_dist = self.d_init
+
         # Initial internal cytoplasm particles
         self.base_internal_pos = generate_internal_particles(
             self.origin, self.r_cell, self.args.internal_particles
@@ -119,14 +160,18 @@ class CellDivisionSim:
         self.cur_internal_pos = self.base_internal_pos.copy()
         if self.n_internal > 0:
             self.u_internal = (self.base_internal_pos - self.origin) / self.r_cell
+            n_half = self.n_internal // 2
+            # Offsets relative to centrosome centers for balanced density
+            self.v_left = (self.base_internal_pos[:n_half] - self.origin) - np.array(
+                [-self.d_init, 0.0, 0.0]
+            )
+            self.v_right = (self.base_internal_pos[n_half:] - self.origin) - np.array(
+                [+self.d_init, 0.0, 0.0]
+            )
         else:
             self.u_internal = np.zeros((0, 3), dtype=np.float64)
-
-        # Spindle parameters (two centrosomes separating inside the cell)
-        # Closer daughter distance so lobes remain in close contact across cleavage furrow
-        self.d_max = self.r_daughter * 0.65  # ~0.26 (lobes in close contact)
-        self.d_init = self.r_daughter * 0.15  # ~0.06
-        self.spindle_dist = self.d_init
+            self.v_left = np.zeros((0, 3), dtype=np.float64)
+            self.v_right = np.zeros((0, 3), dtype=np.float64)
 
         self.pole_0 = np.array(
             [self.origin[0] - self.spindle_dist, self.origin[1], self.origin[2]],
@@ -233,40 +278,31 @@ class CellDivisionSim:
 
         # 2. Internal cytoplasm particles
         if self.n_internal > 0:
-            sign_p = np.where(self.u_internal[:, 0] >= 0, 1.0, -1.0)
-            r_yzi_u = np.sqrt(self.u_internal[:, 1] ** 2 + self.u_internal[:, 2] ** 2)
-            norm_yzi = np.maximum(r_yzi_u, 1e-12)
-            dir_yi = self.u_internal[:, 1] / norm_yzi
-            dir_zi = self.u_internal[:, 2] / norm_yzi
+            n_half = self.n_internal // 2
+            cL_x = -(self.d_init + (self.d_max - self.d_init) * elong_t)
+            cR_x = +(self.d_init + (self.d_max - self.d_init) * elong_t)
+            scale_p = 0.95 + 0.05 * elong_t
 
-            # Continuous axial expansion with spindle elongation
-            # Smooth tanh transition prevents unnatural sudden gap at t=0
-            x_base_p = (
-                self.u_internal[:, 0] * r_l
-                + d * np.tanh(3.0 * self.u_internal[:, 0]) * elong_t
-            )
+            # Left particles translate with left lobe center
+            pts_l = np.zeros((n_half, 3), dtype=np.float64)
+            pts_l[:, 0] = cL_x + self.v_left[:, 0] * scale_p
+            pts_l[:, 1:] = self.v_left[:, 1:] * scale_p
 
-            # Cleavage furrow expulsion:
-            # As contractile ring constricts (constrict_t: 0 -> 1), the furrow membrane
-            # physically squeezes particles axially away from x = 0 into the two lobes
-            furrow_push = (
-                sign_p
-                * np.exp(-x_base_p ** 2 / 0.02)
-                * constrict_t
-                * (d * 0.70)
-            )
-            x_p = x_base_p + furrow_push
+            # Right particles translate with right lobe center
+            pts_r = np.zeros((self.n_internal - n_half, 3), dtype=np.float64)
+            pts_r[:, 0] = cR_x + self.v_right[:, 0] * scale_p
+            pts_r[:, 1:] = self.v_right[:, 1:] * scale_p
 
-            # Ensure clear separation as abscission approaches
-            if constrict_t > 0.4:
-                min_sep = 0.035 * (constrict_t - 0.4) / 0.6
-                x_p = np.where(
-                    sign_p < 0, np.minimum(x_p, -min_sep), np.maximum(x_p, min_sep)
-                )
+            # Furrow clearance as ring constricts
+            min_sep = 0.015 + 0.010 * constrict_t
+            pts_l[pts_l[:, 0] > -min_sep, 0] = -min_sep
+            pts_r[pts_r[:, 0] < min_sep, 0] = min_sep
 
-            # Radial confinement inside the deformed membrane:
-            abs_xp = np.abs(x_p)
-            r_mem_p = np.zeros_like(x_p)
+            pts_rel = np.concatenate([pts_l, pts_r], axis=0)
+
+            # Local membrane radial confinement
+            abs_xp = np.abs(pts_rel[:, 0])
+            r_mem_p = np.zeros_like(abs_xp)
             out_mp = abs_xp >= d
             dx_out_p = abs_xp[out_mp] - d
             r_mem_p[out_mp] = np.sqrt(np.maximum(0.0, r_l ** 2 - dx_out_p ** 2))
@@ -281,13 +317,18 @@ class CellDivisionSim:
             scale_neck_p = (neck_r / r_eq) + (1.0 - neck_r / r_eq) * s_furr_p
             r_mem_final = r_mem_p * scale_neck_p
 
-            # Particle radius in Y-Z dynamically confined by local membrane radius
-            r_target_p = np.minimum(r_yzi_u * r_l, r_mem_final * 0.72)
+            r_yz_p = np.sqrt(pts_rel[:, 1] ** 2 + pts_rel[:, 2] ** 2)
+            max_allowed_r = r_mem_final * 0.75
+            over_r = r_yz_p > max_allowed_r
+            if np.any(over_r):
+                scale_over = max_allowed_r[over_r] / np.maximum(r_yz_p[over_r], 1e-12)
+                pts_rel[over_r, 1] *= scale_over
+                pts_rel[over_r, 2] *= scale_over
 
             pts = np.zeros_like(self.base_internal_pos)
-            pts[:, 0] = self.origin[0] + x_p
-            pts[:, 1] = self.origin[1] + dir_yi * r_target_p
-            pts[:, 2] = self.origin[2] + dir_zi * r_target_p
+            pts[:, 0] = self.origin[0] + pts_rel[:, 0]
+            pts[:, 1] = self.origin[1] + pts_rel[:, 1]
+            pts[:, 2] = self.origin[2] + pts_rel[:, 2]
         else:
             pts = np.zeros((0, 3), dtype=np.float64)
 
