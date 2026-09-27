@@ -245,3 +245,44 @@ def test_autonomous_cell_division_volume_conservation():
     assert len(sim.int_l) + len(sim.int_r) == 80
     assert len(sim.int_l) > 0 and len(sim.int_r) > 0
 
+
+def test_autonomous_cell_division_particle_distribution_and_furrow_stability():
+    """Verify that furrow velocities remain low (no oscillation) and particles do not bunch at the septum."""
+    import argparse
+    from examples.cell_division import CellDivisionSim
+
+    args = argparse.Namespace(
+        subdivisions=2,
+        bag_radius=0.5,
+        internal_particles=100,
+        substeps=15,
+        mode="gauss_seidel",
+        transparency=0.45,
+        point_radius=0.015,
+        headless=True,
+        headless_steps=300,
+    )
+    sim = CellDivisionSim(args, (-1.5, 0.0, -1.5), (1.5, 3.0, 1.5))
+
+    max_ring_v = 0.0
+    for s in range(250):
+        sim.step()
+        if not sim.is_divided and sim.state.value == "CONSTRICTING":
+            v_ring = np.linalg.norm(sim.mother_body.velocities[sim.ring_idx], axis=-1)
+            max_ring_v = max(max_ring_v, float(np.max(v_ring)))
+
+    # 1. Furrow velocities must remain stable without explosion (< 3.0 m/s)
+    assert max_ring_v < 3.0, f"Furrow vibration detected: max velocity = {max_ring_v}"
+
+    # 2. Both daughter cells must exist
+    assert sim.is_divided
+    assert sim.n_int_l > 0 and sim.n_int_r > 0
+
+    # 3. Internal particles in daughter cells must be centered inside the daughter spheres,
+    # NOT clustered near the septum at origin[0] (0.0).
+    cL_x = np.mean(sim.int_l[:, 0])
+    cR_x = np.mean(sim.int_r[:, 0])
+    # The daughter cell centers are around +/- 0.33. Mean x must be away from 0.0 (< -0.15 and > +0.15)
+    assert cL_x < -0.15, f"Left daughter particles bunched at septum: mean x = {cL_x}"
+    assert cR_x > 0.15, f"Right daughter particles bunched at septum: mean x = {cR_x}"
+

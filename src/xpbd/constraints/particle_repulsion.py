@@ -62,7 +62,12 @@ class ParticleFluidConstraint:
 
         closest_v = membrane_positions[closest_idx]
 
-        if faces is not None and len(faces) > 0:
+        if center is not None:
+            c = np.asarray(center, dtype=np.float64)
+            vec_v = closest_v - c
+            norm_v = np.linalg.norm(vec_v, axis=-1, keepdims=True)
+            out_dir = vec_v / np.maximum(norm_v, 1e-12)
+        elif faces is not None and len(faces) > 0:
             f = np.asarray(faces, dtype=np.int64)
             p0 = membrane_positions[f[:, 0]]
             p1 = membrane_positions[f[:, 1]]
@@ -76,9 +81,9 @@ class ParticleFluidConstraint:
             vn_unit = vn / np.maximum(norm_vn, 1e-12)
             out_dir = vn_unit[closest_idx]
         else:
-            c = np.mean(membrane_positions, axis=0) if center is None else np.asarray(center, dtype=np.float64)
+            c = np.mean(membrane_positions, axis=0)
             vec_v = closest_v - c
-            norm_v = np.linalg.norm(vec_v, axis=1, keepdims=True)
+            norm_v = np.linalg.norm(vec_v, axis=-1, keepdims=True)
             out_dir = vec_v / np.maximum(norm_v, 1e-12)
 
         rel = particles - closest_v

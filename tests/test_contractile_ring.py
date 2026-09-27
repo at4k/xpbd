@@ -80,9 +80,30 @@ def test_contractile_ring_center_x_anchoring():
     x_cur = x.copy()
     ring.project(x_cur, inv_mass, h=0.01)
 
-    # Point 0 is radially inactive, but MUST be anchored to x=0 because it is movable
+    # Point 0 is movable, anchored to x=0
     assert np.isclose(x_cur[0, 0], 0.0, atol=1e-4)
-    # Point 1 is radially active, and MUST be anchored to x=0
+    # Point 1 is movable, anchored to x=0
     assert np.isclose(x_cur[1, 0], 0.0, atol=1e-4)
     # Point 2 has inv_mass=0, so its x must NOT move!
     assert np.isclose(x_cur[2, 0], 0.5, atol=1e-4)
+
+
+def test_contractile_ring_bilateral_vs_unilateral():
+    x_in = np.array([[0.0, 0.2, 0.0]], dtype=np.float64)  # radius = 0.2 < 0.5
+    inv_m = np.ones(1)
+
+    # Bilateral pulls or pushes to target radius
+    ring_bi = ContractileRingConstraint(
+        ring_indices=[0], target_radius=0.5, compliance=0.0, unilateral=False
+    )
+    x1 = x_in.copy()
+    ring_bi.project(x1, inv_m, h=0.01)
+    assert np.isclose(x1[0, 1], 0.5, atol=1e-3)
+
+    # Unilateral only pulls inward if radius > target
+    ring_uni = ContractileRingConstraint(
+        ring_indices=[0], target_radius=0.5, compliance=0.0, unilateral=True
+    )
+    x2 = x_in.copy()
+    ring_uni.project(x2, inv_m, h=0.01)
+    assert np.isclose(x2[0, 1], 0.2, atol=1e-3)

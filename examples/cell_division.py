@@ -124,6 +124,7 @@ class CellDivisionSim:
         self.d_init = self.r_daughter * 0.20
         self.d_max = self.r_daughter * 0.55
         self.spindle_dist = self.d_init
+        self.prev_spindle_dist = self.d_init
 
         p0 = np.array([self.origin[0] - self.d_init, self.origin[1], self.origin[2]], dtype=np.float64)
         p1 = np.array([self.origin[0] + self.d_init, self.origin[1], self.origin[2]], dtype=np.float64)
@@ -178,7 +179,8 @@ class CellDivisionSim:
             center_y=float(self.origin[1]),
             center_z=float(self.origin[2]),
             target_radius=float(self.r_cell),
-            compliance=0.0,
+            compliance=1e-4,
+            unilateral=False,
         )
 
         self.particle_con = ParticleFluidConstraint(particle_radius=0.035)
@@ -255,6 +257,24 @@ class CellDivisionSim:
         self.n_int_l = len(pts_l)
         self.n_int_r = len(pts_r)
 
+        # Center and relax particles uniformly within daughter Icospheres
+        if self.n_int_l > 0:
+            pts_l += (center_l - np.mean(pts_l, axis=0))
+        if self.n_int_r > 0:
+            pts_r += (center_r - np.mean(pts_r, axis=0))
+
+        for _ in range(15):
+            if self.n_int_l > 0:
+                self.particle_con.project_repulsion(pts_l)
+                self.particle_con.project_confinement_mesh(
+                    pts_l, pos_l, margin=0.04, center=center_l
+                )
+            if self.n_int_r > 0:
+                self.particle_con.project_repulsion(pts_r)
+                self.particle_con.project_confinement_mesh(
+                    pts_r, pos_r, margin=0.04, center=center_r
+                )
+
         total_l = np.concatenate([pos_l, pts_l], axis=0) if self.n_int_l > 0 else pos_l
         total_r = np.concatenate([pos_r, pts_r], axis=0) if self.n_int_r > 0 else pos_r
 
@@ -320,7 +340,16 @@ class CellDivisionSim:
         """Advances the simulation by one frame DT under XPBD physics."""
         self.time += DT
 
+        # Viscous velocity damping for physiological low-Reynolds Stokes cytoplasm flow
         if not self.is_divided:
+            self.mother_body.velocities *= 0.88
+        else:
+            self.body_left.velocities *= 0.88
+            self.body_right.velocities *= 0.88
+
+        if not self.is_divided:
+            pts = self.mother_body.positions[self.n_surf + 2 :]
+
             # Phase 1: Spindle Elongation
             if self.state == CellDivisionState.ELONGATING:
                 self.elong_prog += self.push_speed * DT
@@ -330,14 +359,16 @@ class CellDivisionSim:
 
                 self.spindle_dist = self.d_init + (self.d_max - self.d_init) * self.elong_prog
                 self.spindle_con.set_target_length(2.0 * self.spindle_dist)
-                self.mother_solver.step(DT)
 
-                # Update internal particles
-                pts = self.mother_body.positions[self.n_surf + 2 :]
-                self.particle_con.project_repulsion(pts)
-                self.particle_con.project_confinement_mesh(
-                    pts, self.mother_body.positions[: self.n_surf], faces=self.faces, margin=0.04
-                )
+                # Continuum volume-preserving elongational flow for internal fluid
+                scale_x = self.spindle_dist / max(self.prev_spindle_dist, 1e-6)
+                self.prev_spindle_dist = self.spindle_dist
+                scale_yz = 1.0 / np.sqrt(scale_x)
+                pts[:, 0] = self.origin[0] + (pts[:, 0] - self.origin[0]) * scale_x
+                pts[:, 1] = self.origin[1] + (pts[:, 1] - self.origin[1]) * scale_yz
+                pts[:, 2] = self.origin[2] + (pts[:, 2] - self.origin[2]) * scale_yz
+
+                self.mother_solver.step(DT)
 
             # Phase 2: Cleavage Furrow Constriction
             elif self.state == CellDivisionState.CONSTRICTING:
@@ -346,11 +377,21 @@ class CellDivisionSim:
                 self.ring_con.set_target_radius(target_r)
                 self.mother_solver.step(DT)
 
-                pts = self.mother_body.positions[self.n_surf + 2 :]
-                self.particle_con.project_repulsion(pts)
-                self.particle_con.project_confinement_mesh(
-                    pts, self.mother_body.positions[: self.n_surf], faces=self.faces, margin=0.04
-                )
+                # Axial fluid expulsion at the constricting cleavage furrow
+                dx = pts[:, 0] - self.origin[0]
+                dy = pts[:, 1] - self.origin[1]
+                dz = pts[:, 2] - self.origin[2]
+                rho = np.sqrt(dy**2 + dz**2)
+                neck_w = self.r_cell * 0.5
+                in_neck = np.where(np.abs(dx) < neck_w)[0]
+                if len(in_neck) > 0:
+                    profile = target_r + (dx[in_neck] / neck_w) ** 2 * (self.r_cell - target_r)
+                    compressed_sub = np.where(rho[in_neck] > profile - 0.04)[0]
+                    if len(compressed_sub) > 0:
+                        idx_c = in_neck[compressed_sub]
+                        sgn = np.sign(dx[idx_c])
+                        sgn[sgn == 0] = np.random.choice([-1.0, 1.0], size=np.sum(sgn == 0))
+                        pts[idx_c, 0] += sgn * 0.025
 
                 # Check if ring constricted to division threshold
                 ring_radii = np.sqrt(
@@ -363,6 +404,16 @@ class CellDivisionSim:
             # Phase 3: Division Trigger
             elif self.state == CellDivisionState.DIVIDING:
                 self.execute_division()
+
+            if not self.is_divided:
+                # Dual-pole confinement for mother cell
+                pole0 = self.mother_body.positions[self.p0_idx]
+                pole1 = self.mother_body.positions[self.p1_idx]
+                centers = np.where(pts[:, 0:1] < self.origin[0], pole0[None, :], pole1[None, :])
+                self.particle_con.project_repulsion(pts)
+                self.particle_con.project_confinement_mesh(
+                    pts, self.mother_body.positions[: self.n_surf], margin=0.04, center=centers
+                )
 
         else:
             # Phase 4: Independent daughter cell dynamics
@@ -377,18 +428,25 @@ class CellDivisionSim:
                 self.body_right.positions[:, 0], self.origin[0]
             )
 
+            # Daughter centers for confinement
+            v_daughter = self.initial_volume / 2.0
+            r_daughter = (v_daughter / (4.0 / 3.0 * np.pi)) ** (1.0 / 3.0)
+            offset = r_daughter * 0.85
+            center_l = np.array([self.origin[0] - offset, self.origin[1], self.origin[2]])
+            center_r = np.array([self.origin[0] + offset, self.origin[1], self.origin[2]])
+
             # Internal particles in daughters
             if self.n_int_l > 0:
                 pts_l = self.body_left.positions[self.n_surf_l :]
                 self.particle_con.project_repulsion(pts_l)
                 self.particle_con.project_confinement_mesh(
-                    pts_l, self.body_left.positions[: self.n_surf_l], faces=self.faces_left, margin=0.04
+                    pts_l, self.body_left.positions[: self.n_surf_l], center=center_l, margin=0.04
                 )
             if self.n_int_r > 0:
                 pts_r = self.body_right.positions[self.n_surf_r :]
                 self.particle_con.project_repulsion(pts_r)
                 self.particle_con.project_confinement_mesh(
-                    pts_r, self.body_right.positions[: self.n_surf_r], faces=self.faces_right, margin=0.04
+                    pts_r, self.body_right.positions[: self.n_surf_r], center=center_r, margin=0.04
                 )
 
     @property

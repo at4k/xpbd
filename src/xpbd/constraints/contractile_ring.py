@@ -21,6 +21,7 @@ class ContractileRingConstraint:
         target_radius: float = 0.5,
         compliance: float = 0.0,
         relaxation: float = 1.0,
+        unilateral: bool = False,
     ) -> None:
         self.ring_indices = np.asarray(ring_indices, dtype=np.int64)
         self.center_y = float(center_y)
@@ -29,6 +30,7 @@ class ContractileRingConstraint:
         self.target_radius = float(target_radius)
         self.compliance = float(compliance)
         self.relaxation = float(relaxation)
+        self.unilateral = bool(unilateral)
         self.lam = np.zeros(len(self.ring_indices), dtype=np.float64)
 
     def set_target_radius(self, radius: float) -> None:
@@ -78,22 +80,25 @@ class ContractileRingConstraint:
         gz = dz / r
         c = r - self.target_radius
 
-        # Unilateral constraint: only pull inward if radius exceeds target
-        active = c > 0
-        if not np.any(active):
-            return
+        if self.unilateral:
+            active = c > 0
+            if not np.any(active):
+                return
 
-        idx_m = idx_m[active]
-        w_m = w_m[active]
-        lam_m = lam_m[active]
-        c = c[active]
-        gy = gy[active]
-        gz = gz[active]
+            idx_m = idx_m[active]
+            w_m = w_m[active]
+            lam_m = lam_m[active]
+            c = c[active]
+            gy = gy[active]
+            gz = gz[active]
+            valid_idx = np.where(movable)[0][valid_r][active]
+        else:
+            valid_idx = np.where(movable)[0][valid_r]
 
         alpha = self.compliance / (h**2)
         denom = w_m + alpha
         dlam = -(c + alpha * lam_m) / np.maximum(denom, _EPS)
-        self.lam[np.where(movable)[0][valid_r][active]] += dlam
+        self.lam[valid_idx] += dlam
 
         corr = dlam * self.relaxation
         x[idx_m, 1] += w_m * corr * gy
@@ -120,7 +125,7 @@ class ContractileRingConstraint:
         gy = dy / r
         gz = dz / r
         c = r - self.target_radius
-        if c <= 0:
+        if self.unilateral and c <= 0:
             return
 
         alpha = self.compliance / (h**2)

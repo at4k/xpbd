@@ -56,3 +56,25 @@ def test_particle_confinement_with_face_normals():
     # Must be pushed inside along true normal (downward in Y)
     dist = np.linalg.norm(pts[0] - origin)
     assert dist <= 0.50
+
+
+def test_particle_confinement_with_array_centers():
+    # Two spheres/lobes with centers at (-1, 0, 0) and (+1, 0, 0)
+    verts_l, _ = icosphere_mesh(subdivisions=1, radius=0.5, origin=(-1.0, 0.0, 0.0))
+    verts_r, _ = icosphere_mesh(subdivisions=1, radius=0.5, origin=(1.0, 0.0, 0.0))
+    all_verts = np.concatenate([verts_l, verts_r], axis=0)
+
+    pts = np.array([
+        [-1.7, 0.0, 0.0],  # outside left lobe (dist from -1 is 0.7 > 0.5)
+        [1.7, 0.0, 0.0],   # outside right lobe (dist from +1 is 0.7 > 0.5)
+    ])
+    centers = np.array([
+        [-1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+    ])
+
+    c = ParticleFluidConstraint(particle_radius=0.04)
+    c.project_confinement_mesh(pts, all_verts, margin=0.04, center=centers)
+
+    assert np.linalg.norm(pts[0] - centers[0]) <= 0.50
+    assert np.linalg.norm(pts[1] - centers[1]) <= 0.50
