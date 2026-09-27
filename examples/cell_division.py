@@ -191,70 +191,67 @@ class CellDivisionSim:
         During elongation and constriction, the cell maintains rounded spherical daughter lobes
         centered at the separating spindle poles rather than a thin elongated sausage.
         """
-        d = self.d_init + (self.d_max - self.d_init) * elong_t
-        r_eff = self.r_cell + (self.r_daughter - self.r_cell) * elong_t
+        d = 0.02 + (self.d_max - 0.02) * elong_t
+        r_l = self.r_cell + (self.r_daughter - self.r_cell) * elong_t
 
         # 1. Surface deformation
-        sign_x = np.sign(self.u_surf[:, 0])
+        sign_x = np.where(self.u_surf[:, 0] >= 0, 1.0, -1.0)
         abs_ux = np.abs(self.u_surf[:, 0])
-        x = sign_x * (abs_ux * r_eff + d * (abs_ux ** 0.8))
+        r_yz_u = np.sqrt(self.u_surf[:, 1] ** 2 + self.u_surf[:, 2] ** 2)
+        norm_yz = np.maximum(r_yz_u, 1e-12)
+        dir_y = self.u_surf[:, 1] / norm_yz
+        dir_z = self.u_surf[:, 2] / norm_yz
 
-        r_yz_base = np.sqrt(self.u_surf[:, 1] ** 2 + self.u_surf[:, 2] ** 2)
-        r_yz = r_yz_base * r_eff
+        # Smooth axial expansion along spindle
+        x = sign_x * (d * (abs_ux ** 0.8) + abs_ux * r_l)
+        abs_x = np.abs(x)
 
-        # Furrow constriction near x = 0
-        waist_width = r_eff * 0.65
-        w = np.clip(np.abs(x) / waist_width, 0.0, 1.0)
-        smooth_w = w * w * (3.0 - 2.0 * w)
-        neck_ratio = 1.0 - constrict_t * (1.0 - 0.06)
-        scale_neck = neck_ratio + (1.0 - neck_ratio) * smooth_w
-        r_yz_final = r_yz * scale_neck
+        # Spherical lobe base radius
+        r_base = np.zeros_like(x)
+        outer_mask = abs_x >= d
+        dx_outer = abs_x[outer_mask] - d
+        r_base[outer_mask] = np.sqrt(np.maximum(0.0, r_l ** 2 - dx_outer ** 2))
 
-        norm_yz = np.sqrt(self.u_surf[:, 1] ** 2 + self.u_surf[:, 2] ** 2)
-        dir_yz = np.zeros((self.n_surf, 2), dtype=np.float64)
-        val = norm_yz > 1e-12
-        dir_yz[val] = self.u_surf[val, 1:3] / norm_yz[val, None]
+        inner_mask = ~outer_mask
+        u = abs_x[inner_mask] / max(d, 1e-6)
+        s = u * u * (3.0 - 2.0 * u)
+        r_eq = np.sqrt(np.maximum(0.05, r_l ** 2 - d ** 2))
+        r_base[inner_mask] = r_eq + (r_l - r_eq) * s
+
+        # Furrow constriction: localized sharp notch at equator
+        neck_r = r_eq * (1.0 - constrict_t * 0.92)
+        w_furrow = 0.12
+        xi = np.clip(abs_x / w_furrow, 0.0, 1.0)
+        s_furrow = xi * xi * (3.0 - 2.0 * xi)
+        scale_neck = (neck_r / r_eq) + (1.0 - neck_r / r_eq) * s_furrow
+        r_final = r_base * scale_neck
 
         surf = np.zeros_like(self.base_surf_pos)
         surf[:, 0] = self.origin[0] + x
-        surf[:, 1] = self.origin[1] + dir_yz[:, 0] * r_yz_final
-        surf[:, 2] = self.origin[2] + dir_yz[:, 1] * r_yz_final
+        surf[:, 1] = self.origin[1] + dir_y * r_final
+        surf[:, 2] = self.origin[2] + dir_z * r_final
 
         # 2. Internal cytoplasm particles
         if self.n_internal > 0:
-            sign_xi = np.sign(self.u_internal[:, 0])
+            sign_xi = np.where(self.u_internal[:, 0] >= 0, 1.0, -1.0)
             abs_uxi = np.abs(self.u_internal[:, 0])
-            xi = sign_xi * (abs_uxi * r_eff + d * (abs_uxi ** 0.8))
+            r_yzi_u = np.sqrt(self.u_internal[:, 1] ** 2 + self.u_internal[:, 2] ** 2)
+            norm_yzi = np.maximum(r_yzi_u, 1e-12)
+            dir_yi = self.u_internal[:, 1] / norm_yzi
+            dir_zi = self.u_internal[:, 2] / norm_yzi
 
-            # Push cytoplasm away from the pinching equator into the two lobes
-            near_eq = np.abs(xi) < waist_width * 0.70
-            xi[near_eq] += (
-                np.where(sign_xi[near_eq] >= 0, 1.0, -1.0)
-                * constrict_t
-                * 0.05
-            )
+            xi = sign_xi * (d * (abs_uxi ** 0.8) + abs_uxi * r_l)
+            abs_xi = np.abs(xi)
+            near_eq = abs_xi < 0.12
+            xi[near_eq] += np.where(sign_xi[near_eq] >= 0, 1.0, -1.0) * constrict_t * 0.04
 
-            # Neck constriction for internal particles
-            wi = np.clip(np.abs(xi) / waist_width, 0.0, 1.0)
-            smooth_wi = wi * wi * (3.0 - 2.0 * wi)
-            scale_neck_i = neck_ratio + (1.0 - neck_ratio) * smooth_wi
-
-            r_yzi = (
-                np.sqrt(self.u_internal[:, 1] ** 2 + self.u_internal[:, 2] ** 2)
-                * r_eff
-                * scale_neck_i
-            )
-            norm_yzi = np.sqrt(
-                self.u_internal[:, 1] ** 2 + self.u_internal[:, 2] ** 2
-            )
-            dir_yzi = np.zeros((self.n_internal, 2), dtype=np.float64)
-            val_i = norm_yzi > 1e-12
-            dir_yzi[val_i] = self.u_internal[val_i, 1:3] / norm_yzi[val_i, None]
+            r_scale = r_yzi_u * (r_l / 1.0)
+            r_final_i = r_scale * (1.0 - constrict_t * 0.3 * np.exp(-abs_xi ** 2 / 0.01))
 
             pts = np.zeros_like(self.base_internal_pos)
             pts[:, 0] = self.origin[0] + xi
-            pts[:, 1] = self.origin[1] + dir_yzi[:, 0] * r_yzi
-            pts[:, 2] = self.origin[2] + dir_yzi[:, 1] * r_yzi
+            pts[:, 1] = self.origin[1] + dir_yi * r_final_i
+            pts[:, 2] = self.origin[2] + dir_zi * r_final_i
         else:
             pts = np.zeros((0, 3), dtype=np.float64)
 
@@ -281,23 +278,24 @@ class CellDivisionSim:
                 + diff[escaped]
                 * (max_radius / np.maximum(dists[escaped], 1e-12))[:, None]
             )
-        # Keep left particles strictly on left side of contact plane (x <= -0.015)
-        # and right particles strictly on right side (x >= +0.015)
+        # Keep left particles strictly on left side of contact plane (x <= origin[0] - 0.015)
+        # and right particles strictly on right side (x >= origin[0] + 0.015)
         if is_left:
-            pts[pts[:, 0] > -0.015, 0] = -0.015
+            pts[pts[:, 0] > self.origin[0] - 0.015, 0] = self.origin[0] - 0.015
         else:
-            pts[pts[:, 0] < 0.015, 0] = 0.015
+            pts[pts[:, 0] < self.origin[0] + 0.015, 0] = self.origin[0] + 0.015
         # Zero out particle velocities so they cannot accumulate momentum or drift
         body.velocities[n_surf:] = 0.0
 
     def execute_division(self):
         """Topological separation into two independent SoftBodies."""
-        cur_surf = self.mother_body.positions[: self.n_surf]
-
-        # Slicing at the exact cleavage furrow midpoint x = origin[0]
         cut_x = float(self.origin[0])
+
+        # Slicing from the full two-lobed geometry at constrict_t = 0 ensures the contact septum
+        # covers the broad physiological contact disk r <= R_contact across the dividing boundary
+        surf_lobed, _ = self._compute_deformed_geometry(1.0, 0.0)
         (pos_l, self.faces_left), (pos_r, self.faces_right) = slice_and_cap_mesh(
-            cur_surf, self.faces, cut_x=cut_x
+            surf_lobed, self.faces, cut_x=cut_x
         )
         self.n_surf_l = len(pos_l)
         self.n_surf_r = len(pos_r)
@@ -434,18 +432,62 @@ class CellDivisionSim:
                 return
 
         else:
-            # Phase 4: Post-division Relaxation & Contact State
-            c_l = np.mean(self.body_left.positions[: self.n_surf_l], axis=0)
-            c_r = np.mean(self.body_right.positions[: self.n_surf_r], axis=0)
+            # Phase 4: Post-division Relaxation & Contact State (Double-Bubble Equilibrium)
+            sphere_center_l = np.array(
+                [self.origin[0] - self.d_max, self.origin[1], self.origin[2]]
+            )
+            sphere_center_r = np.array(
+                [self.origin[0] + self.d_max, self.origin[1], self.origin[2]]
+            )
 
             if self.state == CellDivisionState.RELAXING:
                 self.relax_step_count += 1
 
-                # Tangential surface relaxation on both daughter meshes (point arrangement optimization)
+                # 1. Active cortical rounding force: free outer membrane rounds toward a smooth sphere
+                free_idx_l = np.where(
+                    self.body_left.positions[: self.n_surf_l, 0] < self.origin[0] - 0.005
+                )[0]
+                if len(free_idx_l) > 0:
+                    v_l = self.body_left.positions[free_idx_l] - sphere_center_l
+                    r_l = np.linalg.norm(v_l, axis=1)
+                    target_r_l = r_l + (self.r_daughter - r_l) * 0.12
+                    self.body_left.positions[free_idx_l] = sphere_center_l + (
+                        v_l / np.maximum(r_l[:, None], 1e-12)
+                    ) * target_r_l[:, None]
+                    self.body_left.positions[free_idx_l, 0] = np.minimum(
+                        self.body_left.positions[free_idx_l, 0], self.origin[0]
+                    )
+
+                free_idx_r = np.where(
+                    self.body_right.positions[: self.n_surf_r, 0] > self.origin[0] + 0.005
+                )[0]
+                if len(free_idx_r) > 0:
+                    v_r = self.body_right.positions[free_idx_r] - sphere_center_r
+                    r_r = np.linalg.norm(v_r, axis=1)
+                    target_r_r = r_r + (self.r_daughter - r_r) * 0.12
+                    self.body_right.positions[free_idx_r] = sphere_center_r + (
+                        v_r / np.maximum(r_r[:, None], 1e-12)
+                    ) * target_r_r[:, None]
+                    self.body_right.positions[free_idx_r, 0] = np.maximum(
+                        self.body_right.positions[free_idx_r, 0], self.origin[0]
+                    )
+
+                # 2. Keep contact septum flush at x = origin[0] (contact plane non-penetration)
+                cap_l = np.where(
+                    self.body_left.positions[: self.n_surf_l, 0] >= self.origin[0] - 0.005
+                )[0]
+                self.body_left.positions[cap_l, 0] = self.origin[0]
+
+                cap_r = np.where(
+                    self.body_right.positions[: self.n_surf_r, 0] <= self.origin[0] + 0.005
+                )[0]
+                self.body_right.positions[cap_r, 0] = self.origin[0]
+
+                # 3. Tangential surface relaxation on both daughter meshes (point arrangement optimization)
                 rel_l = tangential_surface_relaxation(
                     self.body_left.positions[: self.n_surf_l],
                     self.faces_left,
-                    center=c_l,
+                    center=sphere_center_l,
                     factor=self.relax_factor,
                     n_iters=1,
                 )
@@ -454,18 +496,53 @@ class CellDivisionSim:
                 rel_r = tangential_surface_relaxation(
                     self.body_right.positions[: self.n_surf_r],
                     self.faces_right,
-                    center=c_r,
+                    center=sphere_center_r,
                     factor=self.relax_factor,
                     n_iters=1,
                 )
                 self.body_right.positions[: self.n_surf_r] = rel_r
+
+                self.body_left.positions[cap_l, 0] = self.origin[0]
+                self.body_right.positions[cap_r, 0] = self.origin[0]
+
+                # 4. Adapt edge rest lengths and volume constraint to the rounded geometry
+                d_l = (
+                    self.body_left.positions[self.body_left.edges[:, 1]]
+                    - self.body_left.positions[self.body_left.edges[:, 0]]
+                )
+                self.dist_con_l.rest_lengths = (
+                    self.dist_con_l.rest_lengths * 0.85
+                    + np.linalg.norm(d_l, axis=1) * 0.15
+                )
+
+                d_r = (
+                    self.body_right.positions[self.body_right.edges[:, 1]]
+                    - self.body_right.positions[self.body_right.edges[:, 0]]
+                )
+                self.dist_con_r.rest_lengths = (
+                    self.dist_con_r.rest_lengths * 0.85
+                    + np.linalg.norm(d_r, axis=1) * 0.15
+                )
+
+                p1_l = self.body_left.positions[self.faces_left[:, 0]]
+                p2_l = self.body_left.positions[self.faces_left[:, 1]]
+                p3_l = self.body_left.positions[self.faces_left[:, 2]]
+                self.vol_con_l.rest_volumes[0] = (
+                    np.sum(np.einsum("ij,ij->i", np.cross(p1_l, p2_l), p3_l)) / 6.0
+                )
+
+                p1_r = self.body_right.positions[self.faces_right[:, 0]]
+                p2_r = self.body_right.positions[self.faces_right[:, 1]]
+                p3_r = self.body_right.positions[self.faces_right[:, 2]]
+                self.vol_con_r.rest_volumes[0] = (
+                    np.sum(np.einsum("ij,ij->i", np.cross(p1_r, p2_r), p3_r)) / 6.0
+                )
 
                 # Damp membrane velocities during relaxation
                 self.body_left.velocities[: self.n_surf_l] *= 0.5
                 self.body_right.velocities[: self.n_surf_r] *= 0.5
 
                 if self.relax_step_count >= 40:
-                    # Finalize edge rest lengths to relaxed shape
                     d_l = (
                         self.body_left.positions[self.body_left.edges[:, 1]]
                         - self.body_left.positions[self.body_left.edges[:, 0]]
@@ -485,16 +562,16 @@ class CellDivisionSim:
                 self._clamp_particles_inside_daughter(
                     self.body_left,
                     self.n_surf_l,
-                    c_l,
-                    self.r_daughter * 0.75,
+                    sphere_center_l,
+                    self.r_daughter * 0.80,
                     is_left=True,
                 )
             if self.n_int_r > 0:
                 self._clamp_particles_inside_daughter(
                     self.body_right,
                     self.n_surf_r,
-                    c_r,
-                    self.r_daughter * 0.75,
+                    sphere_center_r,
+                    self.r_daughter * 0.80,
                     is_left=False,
                 )
 
@@ -506,16 +583,16 @@ class CellDivisionSim:
                 self._clamp_particles_inside_daughter(
                     self.body_left,
                     self.n_surf_l,
-                    c_l,
-                    self.r_daughter * 0.75,
+                    sphere_center_l,
+                    self.r_daughter * 0.80,
                     is_left=True,
                 )
             if self.n_int_r > 0:
                 self._clamp_particles_inside_daughter(
                     self.body_right,
                     self.n_surf_r,
-                    c_r,
-                    self.r_daughter * 0.75,
+                    sphere_center_r,
+                    self.r_daughter * 0.80,
                     is_left=False,
                 )
 
