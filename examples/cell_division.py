@@ -174,6 +174,7 @@ class CellDivisionSim:
 
         self.ring_con = ContractileRingConstraint(
             self.ring_idx,
+            center_x=float(self.origin[0]),
             center_y=float(self.origin[1]),
             center_z=float(self.origin[2]),
             target_radius=float(self.r_cell),
@@ -203,8 +204,8 @@ class CellDivisionSim:
         self.vol_con_r: GlobalVolumeConstraint | None = None
         self.n_surf_l = 0
         self.n_surf_r = 0
-        self.int_l: np.ndarray = np.zeros((0, 3), dtype=np.float64)
-        self.int_r: np.ndarray = np.zeros((0, 3), dtype=np.float64)
+        self.n_int_l = 0
+        self.n_int_r = 0
 
     @property
     def pole_0(self):
@@ -223,13 +224,10 @@ class CellDivisionSim:
         v_daughter = self.initial_volume / 2.0
         r_daughter = (v_daughter / (4.0 / 3.0 * np.pi)) ** (1.0 / 3.0)
 
-        # Calculate centroids of left and right lobes
-        surf = self.mother_body.positions[: self.n_surf]
-        left_mask = surf[:, 0] < self.origin[0]
-        right_mask = surf[:, 0] > self.origin[0]
-
-        center_l = np.mean(surf[left_mask], axis=0)
-        center_r = np.mean(surf[right_mask], axis=0)
+        # Center positions: placing centers so daughters touch at x = origin[0] with physiological contact
+        contact_offset = r_daughter * 0.85
+        center_l = np.array([self.origin[0] - contact_offset, self.origin[1], self.origin[2]])
+        center_r = np.array([self.origin[0] + contact_offset, self.origin[1], self.origin[2]])
 
         pos_l, self.faces_left = icosphere_mesh(
             subdivisions=self.args.subdivisions, radius=r_daughter, origin=center_l
@@ -237,46 +235,63 @@ class CellDivisionSim:
         pos_r, self.faces_right = icosphere_mesh(
             subdivisions=self.args.subdivisions, radius=r_daughter, origin=center_r
         )
+
+        # Pre-clamp contact septum so initial geometry starts flush without velocity jumps
+        pos_l[:, 0] = np.minimum(pos_l[:, 0], self.origin[0])
+        pos_r[:, 0] = np.maximum(pos_r[:, 0], self.origin[0])
+
         self.n_surf_l = len(pos_l)
         self.n_surf_r = len(pos_r)
 
         # Partition internal particles
         pts = self.mother_body.positions[self.n_surf + 2 :]
         is_left = pts[:, 0] < self.origin[0]
-        self.int_l = pts[is_left].copy()
-        self.int_r = pts[~is_left].copy()
+        pts_l = pts[is_left].copy()
+        pts_r = pts[~is_left].copy()
+        self.n_int_l = len(pts_l)
+        self.n_int_r = len(pts_r)
+
+        total_l = np.concatenate([pos_l, pts_l], axis=0) if self.n_int_l > 0 else pos_l
+        total_r = np.concatenate([pos_r, pts_r], axis=0) if self.n_int_r > 0 else pos_r
+
+        inv_m_l = np.ones(len(total_l), dtype=np.float64)
+        inv_m_r = np.ones(len(total_r), dtype=np.float64)
+        if self.n_int_l > 0:
+            inv_m_l[self.n_surf_l :] = 0.0
+        if self.n_int_r > 0:
+            inv_m_r[self.n_surf_r :] = 0.0
 
         # Construct daughter SoftBodies
         edges_l = edges_from_faces(self.faces_left)
         edges_r = edges_from_faces(self.faces_right)
 
         self.body_left = SoftBody(
-            positions=pos_l,
-            velocities=np.zeros_like(pos_l),
-            inv_mass=np.ones(len(pos_l), dtype=np.float64),
+            positions=total_l,
+            velocities=np.zeros_like(total_l),
+            inv_mass=inv_m_l,
             tets=np.zeros((0, 4), dtype=np.int64),
             edges=edges_l,
         )
         self.body_right = SoftBody(
-            positions=pos_r,
-            velocities=np.zeros_like(pos_r),
-            inv_mass=np.ones(len(pos_r), dtype=np.float64),
+            positions=total_r,
+            velocities=np.zeros_like(total_r),
+            inv_mass=inv_m_r,
             tets=np.zeros((0, 4), dtype=np.int64),
             edges=edges_r,
         )
 
         self.dist_con_l = DistanceConstraint.from_positions(
-            self.body_left.positions, edges_l, compliance=1e-3
+            self.body_left.positions[: self.n_surf_l], edges_l, compliance=1e-3
         )
         self.dist_con_r = DistanceConstraint.from_positions(
-            self.body_right.positions, edges_r, compliance=1e-3
+            self.body_right.positions[: self.n_surf_r], edges_r, compliance=1e-3
         )
 
         self.vol_con_l = GlobalVolumeConstraint.from_positions(
-            self.body_left.positions, [self.faces_left], compliance=0.0
+            self.body_left.positions[: self.n_surf_l], [self.faces_left], compliance=0.0
         )
         self.vol_con_r = GlobalVolumeConstraint.from_positions(
-            self.body_right.positions, [self.faces_right], compliance=0.0
+            self.body_right.positions[: self.n_surf_r], [self.faces_right], compliance=0.0
         )
 
         self.solver_left = Solver(
@@ -359,16 +374,30 @@ class CellDivisionSim:
             )
 
             # Internal particles in daughters
-            if len(self.int_l) > 0:
-                self.particle_con.project_repulsion(self.int_l)
+            if self.n_int_l > 0:
+                pts_l = self.body_left.positions[self.n_surf_l :]
+                self.particle_con.project_repulsion(pts_l)
                 self.particle_con.project_confinement_mesh(
-                    self.int_l, self.body_left.positions, margin=0.04
+                    pts_l, self.body_left.positions[: self.n_surf_l], margin=0.04
                 )
-            if len(self.int_r) > 0:
-                self.particle_con.project_repulsion(self.int_r)
+            if self.n_int_r > 0:
+                pts_r = self.body_right.positions[self.n_surf_r :]
+                self.particle_con.project_repulsion(pts_r)
                 self.particle_con.project_confinement_mesh(
-                    self.int_r, self.body_right.positions, margin=0.04
+                    pts_r, self.body_right.positions[: self.n_surf_r], margin=0.04
                 )
+
+    @property
+    def int_l(self):
+        if self.body_left is not None and self.n_int_l > 0:
+            return self.body_left.positions[self.n_surf_l :]
+        return np.zeros((0, 3), dtype=np.float64)
+
+    @property
+    def int_r(self):
+        if self.body_right is not None and self.n_int_r > 0:
+            return self.body_right.positions[self.n_surf_r :]
+        return np.zeros((0, 3), dtype=np.float64)
 
 
 def run_headless(args):

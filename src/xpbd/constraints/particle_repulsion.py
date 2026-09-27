@@ -49,6 +49,7 @@ class ParticleFluidConstraint:
         particles: np.ndarray,
         membrane_positions: np.ndarray,
         margin: float = 0.05,
+        center: np.ndarray | None = None,
     ) -> None:
         """Projects particles to stay within the inner boundary of the membrane mesh."""
         if len(particles) == 0 or len(membrane_positions) == 0:
@@ -58,9 +59,11 @@ class ParticleFluidConstraint:
         dist_sq = np.sum(diff_mesh**2, axis=-1)
         closest_idx = np.argmin(dist_sq, axis=1)
 
+        c = np.mean(membrane_positions, axis=0) if center is None else np.asarray(center, dtype=np.float64)
         closest_v = membrane_positions[closest_idx]
-        norm_v = np.linalg.norm(closest_v, axis=1, keepdims=True)
-        out_dir = closest_v / np.maximum(norm_v, 1e-12)
+        vec_v = closest_v - c
+        norm_v = np.linalg.norm(vec_v, axis=1, keepdims=True)
+        out_dir = vec_v / np.maximum(norm_v, 1e-12)
 
         rel = particles - closest_v
         dot_out = np.sum(rel * out_dir, axis=1)

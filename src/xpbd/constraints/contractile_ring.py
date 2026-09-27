@@ -17,6 +17,7 @@ class ContractileRingConstraint:
         ring_indices: np.ndarray | list[int],
         center_y: float = 0.0,
         center_z: float = 0.0,
+        center_x: float | None = None,
         target_radius: float = 0.5,
         compliance: float = 0.0,
         relaxation: float = 1.0,
@@ -24,6 +25,7 @@ class ContractileRingConstraint:
         self.ring_indices = np.asarray(ring_indices, dtype=np.int64)
         self.center_y = float(center_y)
         self.center_z = float(center_z)
+        self.center_x = float(center_x) if center_x is not None else None
         self.target_radius = float(target_radius)
         self.compliance = float(compliance)
         self.relaxation = float(relaxation)
@@ -93,6 +95,10 @@ class ContractileRingConstraint:
         x[idx_m, 1] += w_m * corr * gy
         x[idx_m, 2] += w_m * corr * gz
 
+        if self.center_x is not None:
+            dx = x[idx, 0] - self.center_x
+            x[idx, 0] -= dx * self.relaxation
+
     def project_one(
         self, k: int, x: np.ndarray, inv_mass: np.ndarray, h: float
     ) -> None:
@@ -111,6 +117,9 @@ class ContractileRingConstraint:
         gz = dz / r
         c = r - self.target_radius
         if c <= 0:
+            if self.center_x is not None:
+                dx = x[idx, 0] - self.center_x
+                x[idx, 0] -= dx * self.relaxation
             return
 
         alpha = self.compliance / (h**2)
@@ -124,3 +133,7 @@ class ContractileRingConstraint:
         corr = dlam * self.relaxation
         x[idx, 1] += w * corr * gy
         x[idx, 2] += w * corr * gz
+
+        if self.center_x is not None:
+            dx = x[idx, 0] - self.center_x
+            x[idx, 0] -= dx * self.relaxation
