@@ -271,3 +271,113 @@ def tangential_surface_relaxation(
 
     return pos
 
+
+def insert_equatorial_ring(
+    positions: np.ndarray,
+    faces: np.ndarray,
+    plane_x: float = 0.0,
+    eps: float = 1e-9,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Subdivides triangles crossing x = plane_x to insert an exact planar ring of vertices.
+
+    Returns:
+        (new_positions, new_faces, ring_vertex_indices)
+        where:
+        - new_positions: (V_new, 3) float64 array
+        - new_faces: (F_new, 3) int64 array
+        - ring_vertex_indices: (N_ring,) int64 array of ordered vertices on plane_x
+    """
+    positions = np.asarray(positions, dtype=np.float64).copy()
+    faces = np.asarray(faces, dtype=np.int64)
+
+    # Slight perturbation if any vertices lie exactly on plane_x
+    on_plane = np.abs(positions[:, 0] - plane_x) < eps
+    if np.any(on_plane):
+        positions[on_plane, 0] += eps * 1.5
+
+    new_verts = list(positions)
+    new_faces = []
+    cut_cache: dict[tuple[int, int], int] = {}
+    ring_edges: list[tuple[int, int]] = []
+
+    def get_cut_vertex(u: int, v: int) -> int:
+        key = (min(u, v), max(u, v))
+        if key in cut_cache:
+            return cut_cache[key]
+        pu = positions[u]
+        pv = positions[v]
+        denom = pv[0] - pu[0]
+        t = (plane_x - pu[0]) / denom if abs(denom) > 1e-15 else 0.5
+        t = float(np.clip(t, 0.0, 1.0))
+        p_cut = pu + t * (pv - pu)
+        p_cut[0] = plane_x
+        idx = len(new_verts)
+        new_verts.append(p_cut)
+        cut_cache[key] = idx
+        return idx
+
+    for f in faces:
+        signs = positions[f, 0] > plane_x
+        num_pos = np.sum(signs)
+
+        if num_pos == 0 or num_pos == 3:
+            # All vertices on same side, triangle untouched
+            new_faces.append(f)
+        elif num_pos == 1:
+            # 1 vertex > plane_x, 2 vertices < plane_x
+            iso_idx = int(np.where(signs)[0][0])
+            v0 = f[iso_idx]
+            v1 = f[(iso_idx + 1) % 3]
+            v2 = f[(iso_idx + 2) % 3]
+
+            i01 = get_cut_vertex(v0, v1)
+            i02 = get_cut_vertex(v0, v2)
+
+            ring_edges.append((i01, i02))
+            new_faces.append(np.array([v0, i01, i02], dtype=np.int64))
+            new_faces.append(np.array([i01, v1, v2], dtype=np.int64))
+            new_faces.append(np.array([i01, v2, i02], dtype=np.int64))
+        else:
+            # 2 vertices > plane_x, 1 vertex < plane_x
+            iso_idx = int(np.where(~signs)[0][0])
+            v0 = f[iso_idx]
+            v1 = f[(iso_idx + 1) % 3]
+            v2 = f[(iso_idx + 2) % 3]
+
+            i01 = get_cut_vertex(v0, v1)
+            i02 = get_cut_vertex(v0, v2)
+
+            ring_edges.append((i01, i02))
+            new_faces.append(np.array([v0, i01, i02], dtype=np.int64))
+            new_faces.append(np.array([i01, v1, v2], dtype=np.int64))
+            new_faces.append(np.array([i01, v2, i02], dtype=np.int64))
+
+    out_positions = np.array(new_verts, dtype=np.float64)
+    out_faces = np.array(new_faces, dtype=np.int64)
+
+    # Order ring vertices cyclically
+    adj: dict[int, list[int]] = {}
+    for u, v in ring_edges:
+        adj.setdefault(u, []).append(v)
+        adj.setdefault(v, []).append(u)
+
+    if not adj:
+        ring_indices = np.array([], dtype=np.int64)
+    else:
+        # Trace the loop starting from an arbitrary node
+        start = next(iter(adj))
+        loop = [start]
+        visited = {start}
+        cur = start
+        while True:
+            neighbors = [nb for nb in adj[cur] if nb not in visited]
+            if not neighbors:
+                break
+            nxt = neighbors[0]
+            loop.append(nxt)
+            visited.add(nxt)
+            cur = nxt
+        ring_indices = np.array(loop, dtype=np.int64)
+
+    return out_positions, out_faces, ring_indices
+
