@@ -236,7 +236,11 @@ class CellDivisionSim:
             subdivisions=self.args.subdivisions, radius=r_daughter, origin=center_r
         )
 
-        # Pre-clamp contact septum so initial geometry starts flush without velocity jumps
+        # Pristine spherical positions for rest geometry and target volume V0 / 2
+        pristine_pos_l = pos_l.copy()
+        pristine_pos_r = pos_r.copy()
+
+        # Pre-clamp contact septum so initial simulation geometry starts flush without velocity jumps
         pos_l[:, 0] = np.minimum(pos_l[:, 0], self.origin[0])
         pos_r[:, 0] = np.maximum(pos_r[:, 0], self.origin[0])
 
@@ -281,17 +285,17 @@ class CellDivisionSim:
         )
 
         self.dist_con_l = DistanceConstraint.from_positions(
-            self.body_left.positions[: self.n_surf_l], edges_l, compliance=1e-3
+            pristine_pos_l, edges_l, compliance=1e-3
         )
         self.dist_con_r = DistanceConstraint.from_positions(
-            self.body_right.positions[: self.n_surf_r], edges_r, compliance=1e-3
+            pristine_pos_r, edges_r, compliance=1e-3
         )
 
         self.vol_con_l = GlobalVolumeConstraint.from_positions(
-            self.body_left.positions[: self.n_surf_l], [self.faces_left], compliance=0.0
+            pristine_pos_l, [self.faces_left], compliance=0.0
         )
         self.vol_con_r = GlobalVolumeConstraint.from_positions(
-            self.body_right.positions[: self.n_surf_r], [self.faces_right], compliance=0.0
+            pristine_pos_r, [self.faces_right], compliance=0.0
         )
 
         self.solver_left = Solver(
@@ -332,7 +336,7 @@ class CellDivisionSim:
                 pts = self.mother_body.positions[self.n_surf + 2 :]
                 self.particle_con.project_repulsion(pts)
                 self.particle_con.project_confinement_mesh(
-                    pts, self.mother_body.positions[: self.n_surf], margin=0.04
+                    pts, self.mother_body.positions[: self.n_surf], faces=self.faces, margin=0.04
                 )
 
             # Phase 2: Cleavage Furrow Constriction
@@ -345,7 +349,7 @@ class CellDivisionSim:
                 pts = self.mother_body.positions[self.n_surf + 2 :]
                 self.particle_con.project_repulsion(pts)
                 self.particle_con.project_confinement_mesh(
-                    pts, self.mother_body.positions[: self.n_surf], margin=0.04
+                    pts, self.mother_body.positions[: self.n_surf], faces=self.faces, margin=0.04
                 )
 
                 # Check if ring constricted to division threshold
@@ -378,13 +382,13 @@ class CellDivisionSim:
                 pts_l = self.body_left.positions[self.n_surf_l :]
                 self.particle_con.project_repulsion(pts_l)
                 self.particle_con.project_confinement_mesh(
-                    pts_l, self.body_left.positions[: self.n_surf_l], margin=0.04
+                    pts_l, self.body_left.positions[: self.n_surf_l], faces=self.faces_left, margin=0.04
                 )
             if self.n_int_r > 0:
                 pts_r = self.body_right.positions[self.n_surf_r :]
                 self.particle_con.project_repulsion(pts_r)
                 self.particle_con.project_confinement_mesh(
-                    pts_r, self.body_right.positions[: self.n_surf_r], margin=0.04
+                    pts_r, self.body_right.positions[: self.n_surf_r], faces=self.faces_right, margin=0.04
                 )
 
     @property

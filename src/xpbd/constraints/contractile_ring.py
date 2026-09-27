@@ -53,7 +53,11 @@ class ContractileRingConstraint:
 
         idx_m = idx[movable]
         w_m = w[movable]
-        lam_m = self.lam[movable]
+
+        # Apply planar X-anchoring unconditionally to all movable ring points
+        if self.center_x is not None:
+            dx = x[idx_m, 0] - self.center_x
+            x[idx_m, 0] -= dx * self.relaxation
 
         dy = x[idx_m, 1] - self.center_y
         dz = x[idx_m, 2] - self.center_z
@@ -65,7 +69,7 @@ class ContractileRingConstraint:
 
         idx_m = idx_m[valid_r]
         w_m = w_m[valid_r]
-        lam_m = lam_m[valid_r]
+        lam_m = self.lam[movable][valid_r]
         r = r[valid_r]
         dy = dy[valid_r]
         dz = dz[valid_r]
@@ -95,10 +99,6 @@ class ContractileRingConstraint:
         x[idx_m, 1] += w_m * corr * gy
         x[idx_m, 2] += w_m * corr * gz
 
-        if self.center_x is not None:
-            dx = x[idx, 0] - self.center_x
-            x[idx, 0] -= dx * self.relaxation
-
     def project_one(
         self, k: int, x: np.ndarray, inv_mass: np.ndarray, h: float
     ) -> None:
@@ -106,6 +106,10 @@ class ContractileRingConstraint:
         w = inv_mass[idx]
         if w < _EPS:
             return
+
+        if self.center_x is not None:
+            dx = x[idx, 0] - self.center_x
+            x[idx, 0] -= dx * self.relaxation
 
         dy = x[idx, 1] - self.center_y
         dz = x[idx, 2] - self.center_z
@@ -117,9 +121,6 @@ class ContractileRingConstraint:
         gz = dz / r
         c = r - self.target_radius
         if c <= 0:
-            if self.center_x is not None:
-                dx = x[idx, 0] - self.center_x
-                x[idx, 0] -= dx * self.relaxation
             return
 
         alpha = self.compliance / (h**2)
@@ -133,7 +134,3 @@ class ContractileRingConstraint:
         corr = dlam * self.relaxation
         x[idx, 1] += w * corr * gy
         x[idx, 2] += w * corr * gz
-
-        if self.center_x is not None:
-            dx = x[idx, 0] - self.center_x
-            x[idx, 0] -= dx * self.relaxation

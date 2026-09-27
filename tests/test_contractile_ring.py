@@ -57,3 +57,32 @@ def test_contractile_ring_project_one():
 
     radii = np.sqrt(x_cur[:, 1] ** 2 + x_cur[:, 2] ** 2)
     assert np.allclose(radii, 0.3, atol=1e-3)
+
+
+def test_contractile_ring_center_x_anchoring():
+    # 2 movable points, 1 fixed point (inv_mass=0)
+    x = np.array([
+        [0.2, 0.4, 0.0],  # radius = 0.4 < target_radius 0.5 (inactive radially)
+        [0.3, 0.8, 0.0],  # radius = 0.8 > target_radius 0.5 (active radially)
+        [0.5, 0.8, 0.0],  # fixed point (inv_mass=0.0)
+    ], dtype=np.float64)
+    inv_mass = np.array([1.0, 1.0, 0.0])
+
+    ring = ContractileRingConstraint(
+        ring_indices=np.arange(3),
+        center_x=0.0,
+        center_y=0.0,
+        center_z=0.0,
+        target_radius=0.5,
+        compliance=0.0,
+    )
+
+    x_cur = x.copy()
+    ring.project(x_cur, inv_mass, h=0.01)
+
+    # Point 0 is radially inactive, but MUST be anchored to x=0 because it is movable
+    assert np.isclose(x_cur[0, 0], 0.0, atol=1e-4)
+    # Point 1 is radially active, and MUST be anchored to x=0
+    assert np.isclose(x_cur[1, 0], 0.0, atol=1e-4)
+    # Point 2 has inv_mass=0, so its x must NOT move!
+    assert np.isclose(x_cur[2, 0], 0.5, atol=1e-4)

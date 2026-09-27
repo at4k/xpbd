@@ -41,3 +41,18 @@ def test_particle_confinement_sphere_mesh():
     # All particles must now be inside radius 1.0 - margin = 0.95
     radii = np.linalg.norm(pts, axis=1)
     assert np.all(radii <= 1.0)
+
+
+def test_particle_confinement_with_face_normals():
+    # Sphere displaced to origin (0, 1.5, 0)
+    origin = (0.0, 1.5, 0.0)
+    verts, faces = icosphere_mesh(subdivisions=2, radius=0.5, origin=origin)
+    c = ParticleFluidConstraint(particle_radius=0.04)
+
+    # Particle outside the top pole at y = 2.2 (radius 0.7 > 0.5)
+    pts = np.array([[0.0, 2.2, 0.0]])
+    c.project_confinement_mesh(pts, verts, faces=faces, margin=0.04)
+
+    # Must be pushed inside along true normal (downward in Y)
+    dist = np.linalg.norm(pts[0] - origin)
+    assert dist <= 0.50
