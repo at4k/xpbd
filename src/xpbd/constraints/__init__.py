@@ -9,6 +9,7 @@ from .collision import ParticleCollisionConstraint
 from .box import BoxConstraint
 from .spindle import SpindleConstraint
 from .contractile_ring import ContractileRingConstraint
+from .particle_repulsion import ParticleFluidConstraint
 
 __all__ = [
     "Constraint",
@@ -20,5 +21,6 @@ __all__ = [
     "BoxConstraint",
     "SpindleConstraint",
     "ContractileRingConstraint",
+    "ParticleFluidConstraint",
 ]
 
